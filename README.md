@@ -8,6 +8,7 @@ NestJS API for the Kigali Car Rent website. The frontend is maintained in
 Set these environment variables in the backend host:
 
 - `DATABASE_URL`: pooled Neon PostgreSQL connection string.
+- `ADMIN_EMAIL`: administrator email address.
 - `ADMIN_PASSWORD`: private admin password of at least 12 characters.
 - `NODE_ENV=production`.
 - Mobile Money provider credentials when payments are enabled.

@@ -16,6 +16,9 @@ const dataDir = process.env.KCR_DATA_DIR || path.join(root, "data");
 const storePath = path.join(dataDir, "store.json");
 const port = Number(process.env.PORT || 3000);
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
+const adminEmail =
+  process.env.ADMIN_EMAIL?.trim().toLowerCase() ||
+  (process.env.NODE_ENV === "production" ? "" : "admin@example.com");
 const adminPassword =
   process.env.ADMIN_PASSWORD ||
   (process.env.NODE_ENV === "production" ? "" : "admin-kigali-2026");
@@ -29,6 +32,9 @@ const providerTokens = new Map();
 function assertAdminPassword() {
   if (!adminPassword || adminPassword.length < 12) {
     throw new Error("Set ADMIN_PASSWORD to a secret of at least 12 characters.");
+  }
+  if (!adminEmail) {
+    throw new Error("Set ADMIN_EMAIL to the administrator email address.");
   }
 }
 
@@ -572,9 +578,20 @@ async function handleApi(req, res, url) {
         .createHash("sha256")
         .update(adminPassword)
         .digest();
-      if (!crypto.timingSafeEqual(suppliedHash, configuredHash)) {
+      const suppliedEmailHash = crypto
+        .createHash("sha256")
+        .update(String(body.email || "").trim().toLowerCase())
+        .digest();
+      const configuredEmailHash = crypto
+        .createHash("sha256")
+        .update(adminEmail)
+        .digest();
+      if (
+        !crypto.timingSafeEqual(suppliedEmailHash, configuredEmailHash) ||
+        !crypto.timingSafeEqual(suppliedHash, configuredHash)
+      ) {
         await logEvent("Admin login failed");
-        return error(res, 401, "Wrong admin password.");
+        return error(res, 401, "Wrong admin email or password.");
       }
       await resetAttempts(req, "admin-login");
       await logEvent("Admin login succeeded");

@@ -14,6 +14,7 @@ test("server persists accounts and protects admin records", async (t) => {
     {
     env: {
       ...process.env,
+      ADMIN_EMAIL: "admin@example.com",
       ADMIN_PASSWORD: "test-admin-password-2026",
       MTN_MOMO_SUBSCRIPTION_KEY: "",
       MTN_MOMO_API_USER: "",
@@ -138,9 +139,20 @@ test("server persists accounts and protects admin records", async (t) => {
 
   const adminLogin = await request("/api/admin/login", {
     method: "POST",
-    body: body({ password: "test-admin-password-2026" }),
+    body: body({
+      email: "ADMIN@example.com",
+      password: "test-admin-password-2026",
+    }),
   });
   assert.equal(adminLogin.status, 200);
+  const wrongAdminEmail = await request("/api/admin/login", {
+    method: "POST",
+    body: body({
+      email: "wrong@example.com",
+      password: "test-admin-password-2026",
+    }),
+  });
+  assert.equal(wrongAdminEmail.status, 401);
   const dashboard = await request("/api/admin/data", {
     headers: { Cookie: cookieFrom(adminLogin) },
   });

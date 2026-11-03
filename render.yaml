@@ -10,6 +10,8 @@ services:
       - key: NODE_ENV
         value: production
       - key: ADMIN_PASSWORD
-        generateValue: true
+        sync: false
+      - key: ADMIN_EMAIL
+        value: iradukundaellaherve@gmail.com
       - key: DATABASE_URL
         sync: false
