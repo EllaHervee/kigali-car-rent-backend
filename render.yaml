@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: kigali-car-rent-backend
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm run start:prod
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
