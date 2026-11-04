@@ -161,7 +161,7 @@ function saveStore() {
   return writeQueue;
 }
 
-async function readJson(req) {
+async function readJson(req, maxLength = 8192) {
   if (!String(req.headers["content-type"] || "").includes("application/json")) {
     throw Object.assign(new Error("Send a JSON request body."), {
       status: 415,
@@ -171,7 +171,7 @@ async function readJson(req) {
   let length = 0;
   for await (const chunk of req) {
     length += chunk.length;
-    if (length > 8192) {
+    if (length > maxLength) {
       throw Object.assign(new Error("Request body is too large."), {
         status: 413,
       });
@@ -585,7 +585,10 @@ async function handleApi(req, res, url) {
       return error(res, 403, "Request origin is not allowed.");
     let body;
     try {
-      body = await readJson(req);
+      body = await readJson(
+        req,
+        url.pathname === "/api/admin/cars" ? 128 * 1024 : undefined,
+      );
     } catch (e) {
       return error(res, e.status || 400, e.message);
     }

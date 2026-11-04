@@ -79,6 +79,16 @@ test("server persists accounts and protects admin records", async (t) => {
   const cookieFrom = (response) =>
     response.headers.get("set-cookie").split(";")[0];
 
+  const oversizedLoginRes = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "nobody@example.com",
+      password: "test",
+      unused: "A".repeat(8192),
+    }),
+  });
+  assert.equal(oversizedLoginRes.status, 413);
+
   const unauthenticated = await request("/api/admin/data");
   assert.equal(unauthenticated.status, 401);
   const unauthenticatedProfileUpdate = await request("/api/me", {
@@ -388,9 +398,14 @@ test("server persists accounts and protects admin records", async (t) => {
       name: "Toyota Land Cruiser V8",
       status: "Rented",
       price: 195000,
+      img: "data:image/jpeg;base64," + "A".repeat(12 * 1024),
     }),
   });
   assert.equal(adminCarsRes.status, 200);
+  assert.equal(
+    (await adminCarsRes.json()).car.img.length,
+    "data:image/jpeg;base64,".length + 12 * 1024,
+  );
 
   const updatedDashboard = await (
     await request("/api/admin/data", { headers: { Cookie: adminCookie } })
