@@ -4,7 +4,6 @@ const fsSync = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { promisify } = require("node:util");
-const nodemailer = require("nodemailer");
 const seedCars = require("./car-catalog");
 
 const scrypt = promisify(crypto.scrypt);
@@ -121,163 +120,6 @@ function isEmail(value) {
 
 function isPhone(value) {
   return /^07\d{8}$/.test(value);
-}
-
-function emailDeliveryConfig() {
-  const provider = String(process.env.EMAIL_PROVIDER || "resend")
-    .trim()
-    .toLowerCase();
-  const from = process.env.EMAIL_FROM;
-  const appBaseUrl = process.env.APP_BASE_URL;
-  let baseUrl;
-  try {
-    baseUrl = new URL(appBaseUrl);
-  } catch {
-    throw Object.assign(
-      new Error("Email verification is not configured on the server."),
-      { status: 503 },
-    );
-  }
-  if (!from) {
-    throw Object.assign(
-      new Error("Email verification is not configured on the server."),
-      { status: 503 },
-    );
-  }
-  if (
-    (process.env.NODE_ENV === "production" && baseUrl.protocol !== "https:") ||
-    (baseUrl.protocol !== "https:" &&
-      !(process.env.NODE_ENV !== "production" && baseUrl.hostname === "localhost"))
-  ) {
-    throw Object.assign(
-      new Error("Email verification requires a secure website URL."),
-      { status: 503 },
-    );
-  }
-  if (provider === "smtp") {
-    const host = process.env.SMTP_HOST || "smtp.gmail.com";
-    const port = Number(process.env.SMTP_PORT || 465);
-    const user = process.env.SMTP_USER;
-    const pass = String(process.env.SMTP_PASS || "").replace(/\s/g, "");
-    if (
-      !host ||
-      !Number.isInteger(port) ||
-      port < 1 ||
-      port > 65535 ||
-      !user ||
-      !pass
-    ) {
-      throw Object.assign(
-        new Error("Email verification is not configured on the server."),
-        { status: 503 },
-      );
-    }
-    return {
-      provider,
-      from,
-      appBaseUrl: baseUrl.origin,
-      smtp: {
-        host,
-        port,
-        secure:
-          process.env.SMTP_SECURE === undefined
-            ? port === 465
-            : process.env.SMTP_SECURE === "true",
-        auth: { user, pass },
-        connectionTimeout: 15000,
-        greetingTimeout: 15000,
-        socketTimeout: 15000,
-      },
-    };
-  }
-  if (provider !== "resend" || !process.env.RESEND_API_KEY) {
-    throw Object.assign(
-      new Error("Email verification is not configured on the server."),
-      { status: 503 },
-    );
-  }
-  return {
-    provider,
-    apiKey: process.env.RESEND_API_KEY,
-    from,
-    appBaseUrl: baseUrl.origin,
-    apiUrl:
-      process.env.NODE_ENV === "test" && process.env.RESEND_API_URL
-        ? process.env.RESEND_API_URL
-        : "https://api.resend.com/emails",
-  };
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (character) => {
-    const entities = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    };
-    return entities[character];
-  });
-}
-
-async function sendVerificationEmail(config, email, name, token) {
-  const verificationUrl =
-    config.appBaseUrl + "/?verifyEmail=" + encodeURIComponent(token);
-  const safeName = escapeHtml(name);
-  const text =
-    "Hello " +
-    name +
-    ",\n\nConfirm your Kigali Car Rent email address:\n" +
-    verificationUrl +
-    "\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.";
-  const html =
-    "<p>Hello " +
-    safeName +
-    ",</p><p>Please confirm your email address to finish creating your Kigali Car Rent account.</p><p><a href=\"" +
-    verificationUrl +
-    "\">Verify my email address</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>";
-  if (config.provider === "smtp") {
-    try {
-      const transporter = nodemailer.createTransport(config.smtp);
-      await transporter.sendMail({
-        from: config.from,
-        to: email,
-        subject: "Verify your Kigali Car Rent email",
-        html,
-        text,
-      });
-    } catch (e) {
-      console.error("SMTP provider rejected a verification message:", e.code || "delivery error");
-      throw Object.assign(
-        new Error("We could not send the verification email. Please try again."),
-        { status: 503 },
-      );
-    }
-    return;
-  }
-  const response = await fetch(config.apiUrl, {
-    method: "POST",
-    headers: {
-      Authorization: "Bearer " + config.apiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      from: config.from,
-      to: [email],
-      subject: "Verify your Kigali Car Rent email",
-      html,
-      text,
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!response.ok) {
-    console.error("Email delivery provider rejected a verification message:", response.status);
-    throw Object.assign(
-      new Error("We could not send the verification email. Please try again."),
-      { status: 503 },
-    );
-  }
 }
 
 function publicUser(identifier, user) {
@@ -632,36 +474,6 @@ async function handleApi(req, res, url) {
     return json(res, 200, { cars: store.cars });
   }
 
-  if (
-    req.method === "GET" &&
-    url.pathname === "/api/email-verification/confirm"
-  ) {
-    const token = String(url.searchParams.get("token") || "");
-    if (!/^[A-Za-z0-9_-]{40,64}$/.test(token)) {
-      return error(res, 400, "This verification link is invalid or expired.");
-    }
-    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
-    const entry = Object.entries(store.users).find(
-      ([, user]) => user.verificationTokenHash === tokenHash,
-    );
-    if (
-      !entry ||
-      !Number.isFinite(entry[1].verificationExpiresAt) ||
-      entry[1].verificationExpiresAt <= Date.now()
-    ) {
-      return error(res, 400, "This verification link is invalid or expired.");
-    }
-    const [identifier, user] = entry;
-    user.emailVerified = true;
-    user.emailVerifiedAt = Date.now();
-    delete user.verificationTokenHash;
-    delete user.verificationExpiresAt;
-    delete user.verificationSentAt;
-    await saveStore();
-    await logEvent("Email verified", identifier);
-    return json(res, 200, { verified: true });
-  }
-
   if (req.method === "GET" && url.pathname === "/api/bookings") {
     const session = await getSession(req);
     if (!session) return json(res, 200, { bookings: [] });
@@ -751,14 +563,6 @@ async function handleApi(req, res, url) {
           "This email address or number already has an account. Please log in.",
         );
       }
-      let deliveryConfig = null;
-      if (email) {
-        try {
-          deliveryConfig = emailDeliveryConfig();
-        } catch (e) {
-          return error(res, e.status || 503, e.message);
-        }
-      }
       const salt = crypto.randomBytes(16).toString("hex");
       const hash = (await passwordHash(password, salt)).toString("hex");
       if (store.users[identifier]) {
@@ -777,45 +581,7 @@ async function handleApi(req, res, url) {
         hash,
         createdAt: Date.now(),
       };
-      let verificationToken = "";
-      if (email) {
-        verificationToken = crypto.randomBytes(32).toString("base64url");
-        user.emailVerified = false;
-        user.verificationTokenHash = crypto
-          .createHash("sha256")
-          .update(verificationToken)
-          .digest("hex");
-        user.verificationExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
-        user.verificationSentAt = Date.now();
-      }
       store.users[identifier] = user;
-      await saveStore();
-      if (email) {
-        try {
-          await sendVerificationEmail(
-            deliveryConfig,
-            email,
-            name,
-            verificationToken,
-          );
-        } catch (e) {
-          delete store.users[identifier];
-          await saveStore();
-          await logEvent("Registration email failed", identifier);
-          return error(
-            res,
-            e.status || 503,
-            e.status ? e.message : "We could not send the verification email. Please try again.",
-          );
-        }
-        await logEvent("Registration pending email verification", identifier);
-        await resetAttempts(req, "register");
-        return json(res, 201, {
-          verificationRequired: true,
-          email,
-          retryAfterSeconds: 60,
-        });
-      }
       await logEvent("Registration succeeded", identifier);
       await resetAttempts(req, "register");
       await createSession(res, "customer", identifier);
@@ -825,61 +591,6 @@ async function handleApi(req, res, url) {
           role: "customer",
         },
       });
-    }
-
-    if (url.pathname === "/api/email-verification/resend") {
-      if (!(await allowAttempt(req, "email-verification"))) {
-        return error(res, 429, "Too many attempts. Try again later.");
-      }
-      const email = normalizeEmail(body.email || body.identifier || "");
-      if (!isEmail(email)) {
-        return error(res, 400, "Enter a valid email address.");
-      }
-      const user = store.users[email];
-      if (!user || !user.email || user.emailVerified !== false) {
-        return json(res, 200, { ok: true, retryAfterSeconds: 60 });
-      }
-      if (
-        user.verificationSentAt &&
-        Date.now() - user.verificationSentAt < 60 * 1000
-      ) {
-        return json(res, 200, { ok: true, retryAfterSeconds: 60 });
-      }
-      let deliveryConfig;
-      try {
-        deliveryConfig = emailDeliveryConfig();
-      } catch (e) {
-        return error(res, e.status || 503, e.message);
-      }
-      const previousToken = {
-        hash: user.verificationTokenHash,
-        expiresAt: user.verificationExpiresAt,
-        sentAt: user.verificationSentAt,
-      };
-      const token = crypto.randomBytes(32).toString("base64url");
-      user.verificationTokenHash = crypto
-        .createHash("sha256")
-        .update(token)
-        .digest("hex");
-      user.verificationExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
-      user.verificationSentAt = Date.now();
-      await saveStore();
-      try {
-        await sendVerificationEmail(deliveryConfig, email, user.name, token);
-      } catch (e) {
-        user.verificationTokenHash = previousToken.hash;
-        user.verificationExpiresAt = previousToken.expiresAt;
-        user.verificationSentAt = previousToken.sentAt;
-        await saveStore();
-        return error(
-          res,
-          e.status || 503,
-          e.status ? e.message : "We could not send the verification email. Please try again.",
-        );
-      }
-      await logEvent("Verification email resent", email);
-      await resetAttempts(req, "email-verification");
-      return json(res, 200, { ok: true, retryAfterSeconds: 60 });
     }
 
     if (url.pathname === "/api/login") {
@@ -910,22 +621,6 @@ async function handleApi(req, res, url) {
       if (!valid) {
         await logEvent("Customer login failed", identifier);
         return error(res, 401, "Wrong email or phone number and password.");
-      }
-      if (user.email && user.emailVerified === false) {
-        await logEvent("Customer login blocked pending email verification", identifier);
-        return json(res, 403, {
-          error: "Please verify your email before logging in.",
-          verificationRequired: true,
-          email: user.email,
-          retryAfterSeconds: Math.max(
-            0,
-            Math.ceil(
-              (60 * 1000 -
-                (Date.now() - (Number(user.verificationSentAt) || 0))) /
-                1000,
-            ),
-          ),
-        });
       }
       await resetAttempts(req, "login");
       await logEvent("Customer login succeeded", identifier);

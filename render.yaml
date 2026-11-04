@@ -15,19 +15,3 @@ services:
         value: iradukundaellaherve@gmail.com
       - key: DATABASE_URL
         sync: false
-      - key: EMAIL_PROVIDER
-        value: smtp
-      - key: EMAIL_FROM
-        value: iradukundaellaherve@gmail.com
-      - key: APP_BASE_URL
-        value: https://kigali-car-rent-frontend-e6qx.vercel.app
-      - key: SMTP_HOST
-        value: smtp.gmail.com
-      - key: SMTP_PORT
-        value: "465"
-      - key: SMTP_SECURE
-        value: "true"
-      - key: SMTP_USER
-        value: iradukundaellaherve@gmail.com
-      - key: SMTP_PASS
-        sync: false

@@ -1,7 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
-const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
@@ -9,50 +8,6 @@ const test = require("node:test");
 
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
-  const emailMessages = [];
-  const emailServer = net.createServer((socket) => {
-    socket.setEncoding("utf8");
-    socket.write("220 localhost ESMTP\r\n");
-    let buffer = "";
-    let message = "";
-    let receivingMessage = false;
-    socket.on("data", (chunk) => {
-      buffer += chunk;
-      let end;
-      while ((end = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, end).replace(/\r$/, "");
-        buffer = buffer.slice(end + 1);
-        if (receivingMessage) {
-          if (line === ".") {
-            emailMessages.push(message);
-            message = "";
-            receivingMessage = false;
-            socket.write("250 Message accepted\r\n");
-          } else {
-            message += line + "\n";
-          }
-          continue;
-        }
-        const command = line.split(" ")[0].toUpperCase();
-        if (command === "EHLO" || command === "HELO") {
-          socket.write("250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 SIZE 52428800\r\n");
-        } else if (command === "AUTH") {
-          socket.write("235 Authentication successful\r\n");
-        } else if (command === "MAIL" || command === "RCPT" || command === "RSET" || command === "NOOP") {
-          socket.write("250 OK\r\n");
-        } else if (command === "DATA") {
-          receivingMessage = true;
-          socket.write("354 End data with <CR><LF>.<CR><LF>\r\n");
-        } else if (command === "QUIT") {
-          socket.end("221 Bye\r\n");
-        } else {
-          socket.end("500 Unsupported SMTP command\r\n");
-        }
-      }
-    });
-  });
-  await new Promise((resolve) => emailServer.listen(0, "127.0.0.1", resolve));
-  const emailPort = emailServer.address().port;
   const server = spawn(
     process.execPath,
     [path.join(__dirname, "../src/legacy-server.js")],
@@ -61,14 +16,6 @@ test("server persists accounts and protects admin records", async (t) => {
         ...process.env,
         ADMIN_EMAIL: "admin@example.com",
         ADMIN_PASSWORD: "test-admin-password-2026",
-        EMAIL_PROVIDER: "smtp",
-        SMTP_HOST: "127.0.0.1",
-        SMTP_PORT: String(emailPort),
-        SMTP_SECURE: "false",
-        SMTP_USER: "sender@example.com",
-        SMTP_PASS: "test-smtp-password",
-        EMAIL_FROM: "Kigali Car Rent <sender@example.com>",
-        APP_BASE_URL: "http://localhost:3000",
         MTN_MOMO_SUBSCRIPTION_KEY: "",
         MTN_MOMO_API_USER: "",
         MTN_MOMO_API_KEY: "",
@@ -91,7 +38,6 @@ test("server persists accounts and protects admin records", async (t) => {
   t.after(async () => {
     server.kill();
     await once(server, "exit").catch(() => {});
-    await new Promise((resolve) => emailServer.close(resolve));
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
@@ -246,75 +192,26 @@ test("server persists accounts and protects admin records", async (t) => {
     }),
   });
   assert.equal(emailRegistration.status, 201);
-  assert.equal(emailRegistration.headers.get("set-cookie"), null);
-  const pendingEmailAccount = await emailRegistration.json();
-  assert.equal(pendingEmailAccount.verificationRequired, true);
-  assert.equal(pendingEmailAccount.email, "new.customer@example.com");
-  assert.equal(emailMessages.length, 1);
-  assert.match(emailMessages[0], /To: new\.customer@example\.com/i);
-  assert.match(emailMessages[0], /From:.*sender@example\.com/i);
-  const decodedEmailMessage = emailMessages[0]
-    .replace(/=\r?\n/g, "")
-    .replace(/=([0-9A-F]{2})/gi, (match, hex) =>
-      String.fromCharCode(parseInt(hex, 16)),
-    );
-  const verificationUrl = new URL(
-    decodedEmailMessage.match(
-      /http:\/\/localhost:3000\/\?verifyEmail=[A-Za-z0-9_-]+/,
-    )[0],
-  );
-  assert.equal(verificationUrl.origin, "http://localhost:3000");
-
-  const unverifiedLogin = await request("/api/login", {
-    method: "POST",
-    body: body({
-      identifier: "NEW.CUSTOMER@EXAMPLE.COM",
-      password: "Customer123",
-    }),
-  });
-  assert.equal(unverifiedLogin.status, 403);
-  assert.equal((await unverifiedLogin.json()).verificationRequired, true);
-
-  const confirmedEmail = await request(
-    "/api/email-verification/confirm?token=" +
-      encodeURIComponent(verificationUrl.searchParams.get("verifyEmail")),
-  );
-  assert.equal(confirmedEmail.status, 200);
-  const replayedVerification = await request(
-    "/api/email-verification/confirm?token=" +
-      encodeURIComponent(verificationUrl.searchParams.get("verifyEmail")),
-  );
-  assert.equal(replayedVerification.status, 400);
-
-  const resendDuringCooldown = await request(
-    "/api/email-verification/resend",
-    {
-      method: "POST",
-      body: body({ email: "new.customer@example.com" }),
-    },
-  );
-  assert.equal(resendDuringCooldown.status, 200);
-  assert.equal(emailMessages.length, 1);
-
-  const emailLogin = await request("/api/login", {
-    method: "POST",
-    body: body({
-      identifier: "NEW.CUSTOMER@EXAMPLE.COM",
-      password: "Customer123",
-    }),
-  });
-  assert.equal(emailLogin.status, 200);
-  const emailAccount = (await emailLogin.json()).user;
+  const emailAccount = (await emailRegistration.json()).user;
   assert.equal(emailAccount.id, "new.customer@example.com");
   assert.equal(emailAccount.email, "new.customer@example.com");
   assert.equal(emailAccount.phone, null);
+  assert.ok(cookieFrom(emailRegistration).startsWith("kcr_session="));
   const restoredEmailAccount = await request("/api/me", {
-    headers: { Cookie: cookieFrom(emailLogin) },
+    headers: { Cookie: cookieFrom(emailRegistration) },
   });
   assert.equal(
     (await restoredEmailAccount.json()).user.email,
     "new.customer@example.com",
   );
+  const emailLogin = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "new.customer@example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(emailLogin.status, 200);
   const duplicateEmail = await request("/api/register", {
     method: "POST",
     body: body({
