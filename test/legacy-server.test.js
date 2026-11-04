@@ -86,6 +86,10 @@ test("server persists accounts and protects admin records", async (t) => {
     body: body({ name: "Iradukunda Ella Herve" }),
   });
   assert.equal(unauthenticatedProfileUpdate.status, 401);
+  const unauthenticatedAccountDeletion = await request("/api/me", {
+    method: "DELETE",
+  });
+  assert.equal(unauthenticatedAccountDeletion.status, 401);
 
   const catalogResponse = await request("/api/cars");
   assert.equal(catalogResponse.status, 200);
@@ -211,6 +215,11 @@ test("server persists accounts and protects admin records", async (t) => {
     body: body({ name: "Unauthorized Change" }),
   });
   assert.equal(adminProfileUpdate.status, 401);
+  const adminAccountDeletion = await request("/api/me", {
+    method: "DELETE",
+    headers: { Cookie: cookieFrom(adminLogin) },
+  });
+  assert.equal(adminAccountDeletion.status, 401);
   const adminEmailRegistration = await request("/api/register", {
     method: "POST",
     body: body({
@@ -408,6 +417,41 @@ test("server persists accounts and protects admin records", async (t) => {
   const staticPage = await request("/");
   assert.equal(staticPage.status, 200);
   assert.match(await staticPage.text(), /Kigali Car Rent/);
+
+  const secondPhoneLogin = await request("/api/login", {
+    method: "POST",
+    body: body({ phone: "0783553434", password: "Customer123" }),
+  });
+  assert.equal(secondPhoneLogin.status, 200);
+  const accountDeletion = await request("/api/me", {
+    method: "DELETE",
+    headers: { Cookie: customerLoginCookie },
+  });
+  assert.equal(accountDeletion.status, 200);
+  assert.deepEqual(await accountDeletion.json(), { ok: true });
+  assert.match(accountDeletion.headers.get("set-cookie"), /Max-Age=0/);
+  assert.equal(
+    (await (
+      await request("/api/me", { headers: { Cookie: customerLoginCookie } })
+    ).json()).user,
+    null,
+  );
+  assert.equal(
+    (await (
+      await request("/api/me", {
+        headers: { Cookie: cookieFrom(secondPhoneLogin) },
+      })
+    ).json()).user,
+    null,
+  );
+  const afterAccountDeletion = await (
+    await request("/api/admin/data", { headers: { Cookie: adminCookie } })
+  ).json();
+  assert.equal(
+    afterAccountDeletion.users.some((user) => user.phone === "0783553434"),
+    false,
+  );
+  assert.equal(afterAccountDeletion.bookings.length, 2);
 
   const adminPage = await request("/admin");
   assert.equal(adminPage.status, 200);

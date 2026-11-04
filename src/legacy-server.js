@@ -554,6 +554,32 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === "DELETE" && url.pathname === "/api/me") {
+    if (!sameOrigin(req)) {
+      return error(res, 403, "Request origin is not allowed.");
+    }
+    const session = await getSession(req);
+    if (!session || session.role !== "customer") {
+      return error(res, 401, "Customer login is required.");
+    }
+    const identifier = session.phone;
+    if (!store.users[identifier]) {
+      return error(res, 404, "Customer account was not found.");
+    }
+    delete store.users[identifier];
+    for (const [token, accountSession] of Object.entries(store.sessions)) {
+      if (
+        accountSession.role === "customer" &&
+        accountSession.phone === identifier
+      ) {
+        delete store.sessions[token];
+      }
+    }
+    await saveStore();
+    res.setHeader("Set-Cookie", cookieOptions(null));
+    return json(res, 200, { ok: true });
+  }
+
   if (req.method === "POST") {
     if (!sameOrigin(req))
       return error(res, 403, "Request origin is not allowed.");

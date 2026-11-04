@@ -27,7 +27,8 @@ number. Email verification is disabled.
 
 Admins use the same login form with `ADMIN_EMAIL` and `ADMIN_PASSWORD`; a
 successful admin login opens the dashboard.
-Customers can update their display name from their signed-in account page.
+Customers can permanently delete their account from their signed-in account
+page. Account deletion keeps existing booking and payment records.
 
 ## Run and verify
 
