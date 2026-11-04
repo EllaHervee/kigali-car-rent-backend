@@ -525,6 +525,35 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/api/me") {
+    if (!sameOrigin(req)) {
+      return error(res, 403, "Request origin is not allowed.");
+    }
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (e) {
+      return error(res, e.status || 400, e.message);
+    }
+    const session = await getSession(req);
+    if (!session || session.role !== "customer") {
+      return error(res, 401, "Customer login is required.");
+    }
+    const user = store.users[session.phone];
+    if (!user) {
+      return error(res, 401, "Customer account was not found.");
+    }
+    const name = String(body.name || "").trim();
+    if (!name || name.length > 100) {
+      return error(res, 400, "Enter a name of at most 100 characters.");
+    }
+    user.name = name;
+    await logEvent("Account name updated", session.phone);
+    return json(res, 200, {
+      user: { ...publicUser(session.phone, user), role: "customer" },
+    });
+  }
+
   if (req.method === "POST") {
     if (!sameOrigin(req))
       return error(res, 403, "Request origin is not allowed.");

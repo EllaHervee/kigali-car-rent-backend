@@ -81,6 +81,11 @@ test("server persists accounts and protects admin records", async (t) => {
 
   const unauthenticated = await request("/api/admin/data");
   assert.equal(unauthenticated.status, 401);
+  const unauthenticatedProfileUpdate = await request("/api/me", {
+    method: "POST",
+    body: body({ name: "Iradukunda Ella Herve" }),
+  });
+  assert.equal(unauthenticatedProfileUpdate.status, 401);
 
   const catalogResponse = await request("/api/cars");
   assert.equal(catalogResponse.status, 200);
@@ -160,6 +165,18 @@ test("server persists accounts and protects admin records", async (t) => {
     body: body({ phone: "0783553434", password: "Customer123" }),
   });
   assert.equal(loggedIn.status, 200);
+  const customerLoginCookie = cookieFrom(loggedIn);
+  const profileUpdated = await request("/api/me", {
+    method: "POST",
+    headers: { Cookie: customerLoginCookie },
+    body: body({ name: "  Iradukunda Ella Herve  " }),
+  });
+  assert.equal(profileUpdated.status, 200);
+  assert.equal((await profileUpdated.json()).user.name, "Iradukunda Ella Herve");
+  const updatedProfile = await request("/api/me", {
+    headers: { Cookie: customerLoginCookie },
+  });
+  assert.equal((await updatedProfile.json()).user.name, "Iradukunda Ella Herve");
 
   const emailRegistered = await request("/api/register", {
     method: "POST",
@@ -188,6 +205,12 @@ test("server persists accounts and protects admin records", async (t) => {
   });
   assert.equal(adminLogin.status, 200);
   assert.equal((await adminLogin.json()).user.role, "admin");
+  const adminProfileUpdate = await request("/api/me", {
+    method: "POST",
+    headers: { Cookie: cookieFrom(adminLogin) },
+    body: body({ name: "Unauthorized Change" }),
+  });
+  assert.equal(adminProfileUpdate.status, 401);
   const adminEmailRegistration = await request("/api/register", {
     method: "POST",
     body: body({
