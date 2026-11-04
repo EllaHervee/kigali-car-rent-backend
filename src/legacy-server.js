@@ -4,6 +4,7 @@ const fsSync = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { promisify } = require("node:util");
+const nodemailer = require("nodemailer");
 const seedCars = require("./car-catalog");
 
 const scrypt = promisify(crypto.scrypt);
@@ -116,19 +117,21 @@ function isPhone(value) {
 }
 
 function emailDeliveryConfig() {
-  const apiKey = process.env.RESEND_API_KEY;
+  const provider = String(process.env.EMAIL_PROVIDER || "resend")
+    .trim()
+    .toLowerCase();
   const from = process.env.EMAIL_FROM;
   const appBaseUrl = process.env.APP_BASE_URL;
-  if (!apiKey || !from || !appBaseUrl) {
+  let baseUrl;
+  try {
+    baseUrl = new URL(appBaseUrl);
+  } catch {
     throw Object.assign(
       new Error("Email verification is not configured on the server."),
       { status: 503 },
     );
   }
-  let baseUrl;
-  try {
-    baseUrl = new URL(appBaseUrl);
-  } catch {
+  if (!from) {
     throw Object.assign(
       new Error("Email verification is not configured on the server."),
       { status: 503 },
@@ -144,8 +147,51 @@ function emailDeliveryConfig() {
       { status: 503 },
     );
   }
+  if (provider === "smtp") {
+    const host = process.env.SMTP_HOST || "smtp.gmail.com";
+    const port = Number(process.env.SMTP_PORT || 465);
+    const user = process.env.SMTP_USER;
+    const pass = String(process.env.SMTP_PASS || "").replace(/\s/g, "");
+    if (
+      !host ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535 ||
+      !user ||
+      !pass
+    ) {
+      throw Object.assign(
+        new Error("Email verification is not configured on the server."),
+        { status: 503 },
+      );
+    }
+    return {
+      provider,
+      from,
+      appBaseUrl: baseUrl.origin,
+      smtp: {
+        host,
+        port,
+        secure:
+          process.env.SMTP_SECURE === undefined
+            ? port === 465
+            : process.env.SMTP_SECURE === "true",
+        auth: { user, pass },
+        connectionTimeout: 15000,
+        greetingTimeout: 15000,
+        socketTimeout: 15000,
+      },
+    };
+  }
+  if (provider !== "resend" || !process.env.RESEND_API_KEY) {
+    throw Object.assign(
+      new Error("Email verification is not configured on the server."),
+      { status: 503 },
+    );
+  }
   return {
-    apiKey,
+    provider,
+    apiKey: process.env.RESEND_API_KEY,
     from,
     appBaseUrl: baseUrl.origin,
     apiUrl:
@@ -172,6 +218,37 @@ async function sendVerificationEmail(config, email, name, token) {
   const verificationUrl =
     config.appBaseUrl + "/?verifyEmail=" + encodeURIComponent(token);
   const safeName = escapeHtml(name);
+  const text =
+    "Hello " +
+    name +
+    ",\n\nConfirm your Kigali Car Rent email address:\n" +
+    verificationUrl +
+    "\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.";
+  const html =
+    "<p>Hello " +
+    safeName +
+    ",</p><p>Please confirm your email address to finish creating your Kigali Car Rent account.</p><p><a href=\"" +
+    verificationUrl +
+    "\">Verify my email address</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>";
+  if (config.provider === "smtp") {
+    try {
+      const transporter = nodemailer.createTransport(config.smtp);
+      await transporter.sendMail({
+        from: config.from,
+        to: email,
+        subject: "Verify your Kigali Car Rent email",
+        html,
+        text,
+      });
+    } catch (e) {
+      console.error("SMTP provider rejected a verification message:", e.code || "delivery error");
+      throw Object.assign(
+        new Error("We could not send the verification email. Please try again."),
+        { status: 503 },
+      );
+    }
+    return;
+  }
   const response = await fetch(config.apiUrl, {
     method: "POST",
     headers: {
@@ -182,18 +259,8 @@ async function sendVerificationEmail(config, email, name, token) {
       from: config.from,
       to: [email],
       subject: "Verify your Kigali Car Rent email",
-      html:
-        "<p>Hello " +
-        safeName +
-        ",</p><p>Please confirm your email address to finish creating your Kigali Car Rent account.</p><p><a href=\"" +
-        verificationUrl +
-        "\">Verify my email address</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>",
-      text:
-        "Hello " +
-        name +
-        ",\n\nConfirm your Kigali Car Rent email address:\n" +
-        verificationUrl +
-        "\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.",
+      html,
+      text,
     }),
     signal: AbortSignal.timeout(15000),
   });

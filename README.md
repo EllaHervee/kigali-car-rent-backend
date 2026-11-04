@@ -11,9 +11,12 @@ Set these environment variables in the backend host:
 - `ADMIN_EMAIL`: administrator email address.
 - `ADMIN_PASSWORD`: private admin password of at least 12 characters.
 - `NODE_ENV=production`.
-- `RESEND_API_KEY`: private API key for sending verification emails through Resend.
-- `EMAIL_FROM`: sender address verified with Resend, such as `Kigali Car Rent <no-reply@your-domain.com>`.
-- `APP_BASE_URL`: public HTTPS origin of the frontend, such as `https://your-site.vercel.app`.
+- `EMAIL_PROVIDER=smtp` to send verification emails over SMTP.
+- `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=465`, and `SMTP_SECURE=true` for Gmail.
+- `SMTP_USER`: the Gmail account used to send messages.
+- `SMTP_PASS`: private Google App Password for that account (not the regular Google password).
+- `EMAIL_FROM`: sender address authorized for that Gmail account.
+- `APP_BASE_URL`: public HTTPS origin of the frontend.
 - Mobile Money provider credentials when payments are enabled.
 
 The API initializes its PostgreSQL state table on the first request and seeds
@@ -23,9 +26,11 @@ not commit the connection string.
 
 Email-based sign-ups remain pending until the recipient opens the one-time
 verification link, which expires after 24 hours. Phone-based sign-ups continue
-without email verification. Verify the sender domain in Resend, then configure
-the three email variables in Render. Keep API keys private and never commit
-them.
+without email verification. For Gmail, enable 2-Step Verification and create
+an App Password in your Google Account. Set `SMTP_PASS` as a private
+environment variable in Render; never commit or share the App Password. The
+verification email is sent from `SMTP_USER` to the address entered during
+sign-up.
 
 ## Run and verify
 

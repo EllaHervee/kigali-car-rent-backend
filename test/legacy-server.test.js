@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
-const http = require("node:http");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
@@ -10,16 +10,49 @@ const test = require("node:test");
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
   const emailMessages = [];
-  const emailServer = http.createServer(async (req, res) => {
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    emailMessages.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: "test-email" }));
+  const emailServer = net.createServer((socket) => {
+    socket.setEncoding("utf8");
+    socket.write("220 localhost ESMTP\r\n");
+    let buffer = "";
+    let message = "";
+    let receivingMessage = false;
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let end;
+      while ((end = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, end).replace(/\r$/, "");
+        buffer = buffer.slice(end + 1);
+        if (receivingMessage) {
+          if (line === ".") {
+            emailMessages.push(message);
+            message = "";
+            receivingMessage = false;
+            socket.write("250 Message accepted\r\n");
+          } else {
+            message += line + "\n";
+          }
+          continue;
+        }
+        const command = line.split(" ")[0].toUpperCase();
+        if (command === "EHLO" || command === "HELO") {
+          socket.write("250-localhost\r\n250-AUTH PLAIN LOGIN\r\n250 SIZE 52428800\r\n");
+        } else if (command === "AUTH") {
+          socket.write("235 Authentication successful\r\n");
+        } else if (command === "MAIL" || command === "RCPT" || command === "RSET" || command === "NOOP") {
+          socket.write("250 OK\r\n");
+        } else if (command === "DATA") {
+          receivingMessage = true;
+          socket.write("354 End data with <CR><LF>.<CR><LF>\r\n");
+        } else if (command === "QUIT") {
+          socket.end("221 Bye\r\n");
+        } else {
+          socket.end("500 Unsupported SMTP command\r\n");
+        }
+      }
+    });
   });
   await new Promise((resolve) => emailServer.listen(0, "127.0.0.1", resolve));
-  const emailApiUrl =
-    "http://127.0.0.1:" + emailServer.address().port + "/emails";
+  const emailPort = emailServer.address().port;
   const server = spawn(
     process.execPath,
     [path.join(__dirname, "../src/legacy-server.js")],
@@ -28,9 +61,13 @@ test("server persists accounts and protects admin records", async (t) => {
         ...process.env,
         ADMIN_EMAIL: "admin@example.com",
         ADMIN_PASSWORD: "test-admin-password-2026",
-        RESEND_API_KEY: "test-resend-key",
-        RESEND_API_URL: emailApiUrl,
-        EMAIL_FROM: "Kigali Car Rent <no-reply@example.com>",
+        EMAIL_PROVIDER: "smtp",
+        SMTP_HOST: "127.0.0.1",
+        SMTP_PORT: String(emailPort),
+        SMTP_SECURE: "false",
+        SMTP_USER: "sender@example.com",
+        SMTP_PASS: "test-smtp-password",
+        EMAIL_FROM: "Kigali Car Rent <sender@example.com>",
         APP_BASE_URL: "http://localhost:3000",
         MTN_MOMO_SUBSCRIPTION_KEY: "",
         MTN_MOMO_API_USER: "",
@@ -214,9 +251,17 @@ test("server persists accounts and protects admin records", async (t) => {
   assert.equal(pendingEmailAccount.verificationRequired, true);
   assert.equal(pendingEmailAccount.email, "new.customer@example.com");
   assert.equal(emailMessages.length, 1);
-  assert.deepEqual(emailMessages[0].to, ["new.customer@example.com"]);
+  assert.match(emailMessages[0], /To: new\.customer@example\.com/i);
+  assert.match(emailMessages[0], /From:.*sender@example\.com/i);
+  const decodedEmailMessage = emailMessages[0]
+    .replace(/=\r?\n/g, "")
+    .replace(/=([0-9A-F]{2})/gi, (match, hex) =>
+      String.fromCharCode(parseInt(hex, 16)),
+    );
   const verificationUrl = new URL(
-    emailMessages[0].text.match(/https?:\/\/\S+/)[0],
+    decodedEmailMessage.match(
+      /http:\/\/localhost:3000\/\?verifyEmail=[A-Za-z0-9_-]+/,
+    )[0],
   );
   assert.equal(verificationUrl.origin, "http://localhost:3000");
 
