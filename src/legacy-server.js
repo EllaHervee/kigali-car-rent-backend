@@ -10,6 +10,13 @@ const seedCars = require("./car-catalog");
 const scrypt = promisify(crypto.scrypt);
 const catalogSeedVersion = 1;
 const backendRoot = path.resolve(__dirname, "..");
+const localEnvPath = [
+  path.join(backendRoot, ".env"),
+  path.resolve(backendRoot, "..", ".env"),
+].find((candidate) => fsSync.existsSync(candidate));
+if (localEnvPath && process.loadEnvFile) {
+  process.loadEnvFile(localEnvPath);
+}
 const workspaceRoot = path.resolve(backendRoot, "..");
 const root = fsSync.existsSync(path.join(workspaceRoot, "frontend", "public"))
   ? workspaceRoot

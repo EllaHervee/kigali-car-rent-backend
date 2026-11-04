@@ -5,6 +5,10 @@ NestJS API for the Kigali Car Rent website. The frontend is maintained in
 
 ## Configure
 
+For local development, fill in `backend/.env` with your private values. That
+file is ignored by Git. Render does not read this local file; set production
+values in the Render service's Environment page.
+
 Set these environment variables in the backend host:
 
 - `DATABASE_URL`: pooled Neon PostgreSQL connection string.
