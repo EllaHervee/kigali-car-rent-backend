@@ -179,14 +179,32 @@ test("server persists accounts and protects admin records", async (t) => {
   });
   assert.equal(emailLoggedIn.status, 200);
 
-  const adminLogin = await request("/api/admin/login", {
+  const adminLogin = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "ADMIN@example.com",
+      password: "test-admin-password-2026",
+    }),
+  });
+  assert.equal(adminLogin.status, 200);
+  assert.equal((await adminLogin.json()).user.role, "admin");
+  const adminEmailRegistration = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Admin Account",
+      identifier: "ADMIN@example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(adminEmailRegistration.status, 409);
+  const legacyAdminLogin = await request("/api/admin/login", {
     method: "POST",
     body: body({
       email: "ADMIN@example.com",
       password: "test-admin-password-2026",
     }),
   });
-  assert.equal(adminLogin.status, 200);
+  assert.equal(legacyAdminLogin.status, 200);
   const wrongAdminEmail = await request("/api/admin/login", {
     method: "POST",
     body: body({

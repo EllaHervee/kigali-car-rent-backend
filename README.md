@@ -25,6 +25,9 @@ not commit the connection string.
 Users can sign up and log in using either their email address or Rwanda phone
 number. Email verification is disabled.
 
+Admins use the same login form with `ADMIN_EMAIL` and `ADMIN_PASSWORD`; a
+successful admin login opens the dashboard.
+
 ## Run and verify
 
 ```powershell

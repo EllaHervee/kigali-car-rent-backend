@@ -237,6 +237,26 @@ function secureEqual(left, right) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function validAdminCredentials(email, password) {
+  const suppliedHash = crypto.createHash("sha256").update(password).digest();
+  const configuredHash = crypto
+    .createHash("sha256")
+    .update(adminPassword)
+    .digest();
+  const suppliedEmailHash = crypto
+    .createHash("sha256")
+    .update(email)
+    .digest();
+  const configuredEmailHash = crypto
+    .createHash("sha256")
+    .update(adminEmail)
+    .digest();
+  return (
+    crypto.timingSafeEqual(suppliedEmailHash, configuredEmailHash) &&
+    crypto.timingSafeEqual(suppliedHash, configuredHash)
+  );
+}
+
 function paymentPublic(payment) {
   return {
     id: payment.id,
@@ -539,6 +559,13 @@ async function handleApi(req, res, url) {
           "Enter a valid email address or Rwanda mobile number.",
         );
       }
+      if (email && email === adminEmail) {
+        return error(
+          res,
+          409,
+          "This email address is reserved for the administrator.",
+        );
+      }
       if (password.length < 8 || password.length > 128) {
         return error(
           res,
@@ -596,9 +623,6 @@ async function handleApi(req, res, url) {
     }
 
     if (url.pathname === "/api/login") {
-      if (!(await allowAttempt(req, "login"))) {
-        return error(res, 429, "Too many attempts. Try again later.");
-      }
       const suppliedIdentifier =
         body.identifier !== undefined ? body.identifier : body.phone;
       const rawIdentifier = String(suppliedIdentifier || "").trim();
@@ -606,6 +630,21 @@ async function handleApi(req, res, url) {
         ? normalizeEmail(rawIdentifier)
         : normalizePhone(rawIdentifier);
       const password = String(body.password || "");
+      const adminLogin = isEmail(identifier) && identifier === adminEmail;
+      const attemptRoute = adminLogin ? "admin-login" : "login";
+      if (!(await allowAttempt(req, attemptRoute))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      if (adminLogin) {
+        if (!validAdminCredentials(identifier, password)) {
+          await logEvent("Admin login failed");
+          return error(res, 401, "Wrong email or phone number and password.");
+        }
+        await resetAttempts(req, attemptRoute);
+        await logEvent("Admin login succeeded");
+        await createSession(res, "admin");
+        return json(res, 200, { user: { role: "admin" } });
+      }
       if (
         (!isPhone(identifier) && !isEmail(identifier)) ||
         password.length > 1024
@@ -636,26 +675,9 @@ async function handleApi(req, res, url) {
       if (!(await allowAttempt(req, "admin-login"))) {
         return error(res, 429, "Too many attempts. Try again later.");
       }
-      const suppliedHash = crypto
-        .createHash("sha256")
-        .update(String(body.password || ""))
-        .digest();
-      const configuredHash = crypto
-        .createHash("sha256")
-        .update(adminPassword)
-        .digest();
-      const suppliedEmailHash = crypto
-        .createHash("sha256")
-        .update(String(body.email || "").trim().toLowerCase())
-        .digest();
-      const configuredEmailHash = crypto
-        .createHash("sha256")
-        .update(adminEmail)
-        .digest();
-      if (
-        !crypto.timingSafeEqual(suppliedEmailHash, configuredEmailHash) ||
-        !crypto.timingSafeEqual(suppliedHash, configuredHash)
-      ) {
+      const email = normalizeEmail(body.email);
+      const password = String(body.password || "");
+      if (!validAdminCredentials(email, password)) {
         await logEvent("Admin login failed");
         return error(res, 401, "Wrong admin email or password.");
       }
