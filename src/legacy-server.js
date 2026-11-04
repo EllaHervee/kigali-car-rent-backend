@@ -4,8 +4,10 @@ const fsSync = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const { promisify } = require("node:util");
+const seedCars = require("./car-catalog");
 
 const scrypt = promisify(crypto.scrypt);
+const catalogSeedVersion = 1;
 const backendRoot = path.resolve(__dirname, "..");
 const workspaceRoot = path.resolve(backendRoot, "..");
 const root = fsSync.existsSync(path.join(workspaceRoot, "frontend", "public"))
@@ -99,14 +101,125 @@ function normalizePhone(value) {
     .replace(/^250/, "0");
 }
 
-function publicUser(phone, user) {
-  return { name: user.name, phone, joinedAt: user.createdAt };
+function normalizeEmail(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
 }
 
-function logEvent(action, phone) {
+function isEmail(value) {
+  return value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+function isPhone(value) {
+  return /^07\d{8}$/.test(value);
+}
+
+function emailDeliveryConfig() {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM;
+  const appBaseUrl = process.env.APP_BASE_URL;
+  if (!apiKey || !from || !appBaseUrl) {
+    throw Object.assign(
+      new Error("Email verification is not configured on the server."),
+      { status: 503 },
+    );
+  }
+  let baseUrl;
+  try {
+    baseUrl = new URL(appBaseUrl);
+  } catch {
+    throw Object.assign(
+      new Error("Email verification is not configured on the server."),
+      { status: 503 },
+    );
+  }
+  if (
+    (process.env.NODE_ENV === "production" && baseUrl.protocol !== "https:") ||
+    (baseUrl.protocol !== "https:" &&
+      !(process.env.NODE_ENV !== "production" && baseUrl.hostname === "localhost"))
+  ) {
+    throw Object.assign(
+      new Error("Email verification requires a secure website URL."),
+      { status: 503 },
+    );
+  }
+  return {
+    apiKey,
+    from,
+    appBaseUrl: baseUrl.origin,
+    apiUrl:
+      process.env.NODE_ENV === "test" && process.env.RESEND_API_URL
+        ? process.env.RESEND_API_URL
+        : "https://api.resend.com/emails",
+  };
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => {
+    const entities = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+    return entities[character];
+  });
+}
+
+async function sendVerificationEmail(config, email, name, token) {
+  const verificationUrl =
+    config.appBaseUrl + "/?verifyEmail=" + encodeURIComponent(token);
+  const safeName = escapeHtml(name);
+  const response = await fetch(config.apiUrl, {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer " + config.apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: config.from,
+      to: [email],
+      subject: "Verify your Kigali Car Rent email",
+      html:
+        "<p>Hello " +
+        safeName +
+        ",</p><p>Please confirm your email address to finish creating your Kigali Car Rent account.</p><p><a href=\"" +
+        verificationUrl +
+        "\">Verify my email address</a></p><p>This link expires in 24 hours. If you did not create an account, you can ignore this message.</p>",
+      text:
+        "Hello " +
+        name +
+        ",\n\nConfirm your Kigali Car Rent email address:\n" +
+        verificationUrl +
+        "\n\nThis link expires in 24 hours. If you did not create an account, you can ignore this message.",
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    console.error("Email delivery provider rejected a verification message:", response.status);
+    throw Object.assign(
+      new Error("We could not send the verification email. Please try again."),
+      { status: 503 },
+    );
+  }
+}
+
+function publicUser(identifier, user) {
+  return {
+    id: identifier,
+    name: user.name,
+    phone: user.phone || (isPhone(identifier) ? identifier : null),
+    email: user.email || (isEmail(identifier) ? identifier : null),
+    joinedAt: user.createdAt,
+  };
+}
+
+function logEvent(action, identifier) {
   store.authEvents.push({
     action,
-    phone: phone ? String(phone).slice(0, 20) : null,
+    phone: identifier ? String(identifier).slice(0, 254) : null,
     ts: Date.now(),
   });
   if (store.authEvents.length > 5000) {
@@ -223,6 +336,7 @@ function adminPayment(payment) {
     ...paymentPublic(payment),
     name: payment.name,
     phone: payment.phone,
+    accountId: payment.accountId || null,
   };
 }
 
@@ -444,15 +558,49 @@ async function handleApi(req, res, url) {
     return json(res, 200, { cars: store.cars });
   }
 
+  if (
+    req.method === "GET" &&
+    url.pathname === "/api/email-verification/confirm"
+  ) {
+    const token = String(url.searchParams.get("token") || "");
+    if (!/^[A-Za-z0-9_-]{40,64}$/.test(token)) {
+      return error(res, 400, "This verification link is invalid or expired.");
+    }
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const entry = Object.entries(store.users).find(
+      ([, user]) => user.verificationTokenHash === tokenHash,
+    );
+    if (
+      !entry ||
+      !Number.isFinite(entry[1].verificationExpiresAt) ||
+      entry[1].verificationExpiresAt <= Date.now()
+    ) {
+      return error(res, 400, "This verification link is invalid or expired.");
+    }
+    const [identifier, user] = entry;
+    user.emailVerified = true;
+    user.emailVerifiedAt = Date.now();
+    delete user.verificationTokenHash;
+    delete user.verificationExpiresAt;
+    delete user.verificationSentAt;
+    await saveStore();
+    await logEvent("Email verified", identifier);
+    return json(res, 200, { verified: true });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/bookings") {
     const session = await getSession(req);
     if (!session) return json(res, 200, { bookings: [] });
     if (session.role === "admin") {
       return json(res, 200, { bookings: store.bookings });
     }
-    const phone = session.phone;
+    const user = store.users[session.phone];
     return json(res, 200, {
-      bookings: store.bookings.filter((b) => b.phone === phone),
+      bookings: store.bookings.filter(
+        (booking) =>
+          booking.accountId === session.phone ||
+          (user?.phone && booking.phone === user.phone),
+      ),
     });
   }
 
@@ -484,13 +632,24 @@ async function handleApi(req, res, url) {
         return error(res, 429, "Too many attempts. Try again later.");
       }
       const name = String(body.name || "").trim();
-      const phone = normalizePhone(body.phone);
+      const suppliedIdentifier =
+        body.identifier !== undefined ? body.identifier : body.phone;
+      const rawIdentifier = String(suppliedIdentifier || "").trim();
+      const email = rawIdentifier.includes("@")
+        ? normalizeEmail(rawIdentifier)
+        : "";
+      const phone = email ? "" : normalizePhone(rawIdentifier);
+      const identifier = email || phone;
       const password = String(body.password || "");
       if (!name || name.length > 100) {
         return error(res, 400, "Enter a name of at most 100 characters.");
       }
-      if (!/^07\d{8}$/.test(phone)) {
-        return error(res, 400, "Enter a valid Rwanda mobile number.");
+      if (!isEmail(email) && !isPhone(phone)) {
+        return error(
+          res,
+          400,
+          "Enter a valid email address or Rwanda mobile number.",
+        );
       }
       if (password.length < 8 || password.length > 128) {
         return error(
@@ -510,44 +669,164 @@ async function handleApi(req, res, url) {
           "Include at least one uppercase letter, one lowercase letter, and one number.",
         );
       }
-      if (store.users[phone]) {
-        await logEvent("Registration failed", phone);
+      if (store.users[identifier]) {
+        await logEvent("Registration failed", identifier);
         return error(
           res,
           409,
-          "This number already has an account. Please log in.",
+          "This email address or number already has an account. Please log in.",
         );
+      }
+      let deliveryConfig = null;
+      if (email) {
+        try {
+          deliveryConfig = emailDeliveryConfig();
+        } catch (e) {
+          return error(res, e.status || 503, e.message);
+        }
       }
       const salt = crypto.randomBytes(16).toString("hex");
       const hash = (await passwordHash(password, salt)).toString("hex");
-      if (store.users[phone]) {
-        await logEvent("Registration failed", phone);
+      if (store.users[identifier]) {
+        await logEvent("Registration failed", identifier);
         return error(
           res,
           409,
-          "This number already has an account. Please log in.",
+          "This email address or number already has an account. Please log in.",
         );
       }
-      store.users[phone] = { name, salt, hash, createdAt: Date.now() };
-      await logEvent("Registration succeeded", phone);
+      const user = {
+        name,
+        phone: phone || null,
+        email: email || null,
+        salt,
+        hash,
+        createdAt: Date.now(),
+      };
+      let verificationToken = "";
+      if (email) {
+        verificationToken = crypto.randomBytes(32).toString("base64url");
+        user.emailVerified = false;
+        user.verificationTokenHash = crypto
+          .createHash("sha256")
+          .update(verificationToken)
+          .digest("hex");
+        user.verificationExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+        user.verificationSentAt = Date.now();
+      }
+      store.users[identifier] = user;
+      await saveStore();
+      if (email) {
+        try {
+          await sendVerificationEmail(
+            deliveryConfig,
+            email,
+            name,
+            verificationToken,
+          );
+        } catch (e) {
+          delete store.users[identifier];
+          await saveStore();
+          await logEvent("Registration email failed", identifier);
+          return error(
+            res,
+            e.status || 503,
+            e.status ? e.message : "We could not send the verification email. Please try again.",
+          );
+        }
+        await logEvent("Registration pending email verification", identifier);
+        await resetAttempts(req, "register");
+        return json(res, 201, {
+          verificationRequired: true,
+          email,
+          retryAfterSeconds: 60,
+        });
+      }
+      await logEvent("Registration succeeded", identifier);
       await resetAttempts(req, "register");
-      await createSession(res, "customer", phone);
+      await createSession(res, "customer", identifier);
       return json(res, 201, {
-        user: { ...publicUser(phone, store.users[phone]), role: "customer" },
+        user: {
+          ...publicUser(identifier, store.users[identifier]),
+          role: "customer",
+        },
       });
+    }
+
+    if (url.pathname === "/api/email-verification/resend") {
+      if (!(await allowAttempt(req, "email-verification"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      const email = normalizeEmail(body.email || body.identifier || "");
+      if (!isEmail(email)) {
+        return error(res, 400, "Enter a valid email address.");
+      }
+      const user = store.users[email];
+      if (!user || !user.email || user.emailVerified !== false) {
+        return json(res, 200, { ok: true, retryAfterSeconds: 60 });
+      }
+      if (
+        user.verificationSentAt &&
+        Date.now() - user.verificationSentAt < 60 * 1000
+      ) {
+        return json(res, 200, { ok: true, retryAfterSeconds: 60 });
+      }
+      let deliveryConfig;
+      try {
+        deliveryConfig = emailDeliveryConfig();
+      } catch (e) {
+        return error(res, e.status || 503, e.message);
+      }
+      const previousToken = {
+        hash: user.verificationTokenHash,
+        expiresAt: user.verificationExpiresAt,
+        sentAt: user.verificationSentAt,
+      };
+      const token = crypto.randomBytes(32).toString("base64url");
+      user.verificationTokenHash = crypto
+        .createHash("sha256")
+        .update(token)
+        .digest("hex");
+      user.verificationExpiresAt = Date.now() + 24 * 60 * 60 * 1000;
+      user.verificationSentAt = Date.now();
+      await saveStore();
+      try {
+        await sendVerificationEmail(deliveryConfig, email, user.name, token);
+      } catch (e) {
+        user.verificationTokenHash = previousToken.hash;
+        user.verificationExpiresAt = previousToken.expiresAt;
+        user.verificationSentAt = previousToken.sentAt;
+        await saveStore();
+        return error(
+          res,
+          e.status || 503,
+          e.status ? e.message : "We could not send the verification email. Please try again.",
+        );
+      }
+      await logEvent("Verification email resent", email);
+      await resetAttempts(req, "email-verification");
+      return json(res, 200, { ok: true, retryAfterSeconds: 60 });
     }
 
     if (url.pathname === "/api/login") {
       if (!(await allowAttempt(req, "login"))) {
         return error(res, 429, "Too many attempts. Try again later.");
       }
-      const phone = normalizePhone(body.phone);
+      const suppliedIdentifier =
+        body.identifier !== undefined ? body.identifier : body.phone;
+      const rawIdentifier = String(suppliedIdentifier || "").trim();
+      const identifier = rawIdentifier.includes("@")
+        ? normalizeEmail(rawIdentifier)
+        : normalizePhone(rawIdentifier);
       const password = String(body.password || "");
-      if (!/^07\d{8}$/.test(phone) || password.length > 1024) {
-        await logEvent("Customer login failed", phone);
-        return error(res, 401, "Wrong phone number or password.");
+      if (
+        (!isPhone(identifier) && !isEmail(identifier)) ||
+        password.length > 1024
+      ) {
+        await logEvent("Customer login failed", identifier);
+        return error(res, 401, "Wrong email or phone number and password.");
       }
-      const user = store.users[phone];
+      const user = store.users[identifier];
       const calculatedHash = await passwordHash(
         password,
         user ? user.salt : "kcr-invalid-account-salt",
@@ -555,14 +834,30 @@ async function handleApi(req, res, url) {
       const valid =
         user && secureEqual(calculatedHash, Buffer.from(user.hash, "hex"));
       if (!valid) {
-        await logEvent("Customer login failed", phone);
-        return error(res, 401, "Wrong phone number or password.");
+        await logEvent("Customer login failed", identifier);
+        return error(res, 401, "Wrong email or phone number and password.");
+      }
+      if (user.email && user.emailVerified === false) {
+        await logEvent("Customer login blocked pending email verification", identifier);
+        return json(res, 403, {
+          error: "Please verify your email before logging in.",
+          verificationRequired: true,
+          email: user.email,
+          retryAfterSeconds: Math.max(
+            0,
+            Math.ceil(
+              (60 * 1000 -
+                (Date.now() - (Number(user.verificationSentAt) || 0))) /
+                1000,
+            ),
+          ),
+        });
       }
       await resetAttempts(req, "login");
-      await logEvent("Customer login succeeded", phone);
-      await createSession(res, "customer", phone);
+      await logEvent("Customer login succeeded", identifier);
+      await createSession(res, "customer", identifier);
       return json(res, 200, {
-        user: { ...publicUser(phone, user), role: "customer" },
+        user: { ...publicUser(identifier, user), role: "customer" },
       });
     }
 
@@ -636,6 +931,10 @@ async function handleApi(req, res, url) {
         createdAt: Date.now(),
         confirmedAt: null,
       };
+      const session = await getSession(req);
+      if (session?.role === "customer" && store.users[session.phone]) {
+        payment.accountId = session.phone;
+      }
       store.payments.push(payment);
       await saveStore();
       try {
@@ -714,6 +1013,10 @@ async function handleApi(req, res, url) {
         status,
         createdAt: Date.now(),
       };
+      const session = await getSession(req);
+      if (session?.role === "customer" && store.users[session.phone]) {
+        booking.accountId = session.phone;
+      }
       store.bookings.unshift(booking);
       await logEvent("New booking " + ref, phone);
       await saveStore();
@@ -885,8 +1188,8 @@ async function handleApi(req, res, url) {
       return error(res, 401, "Admin login is required.");
     }
     return json(res, 200, {
-      users: Object.keys(store.users).map((phone) =>
-        publicUser(phone, store.users[phone]),
+      users: Object.keys(store.users).map((identifier) =>
+        publicUser(identifier, store.users[identifier]),
       ),
       authEvents: store.authEvents,
       payments: store.payments.map(adminPayment),
@@ -946,11 +1249,21 @@ function emptyStore() {
     authEvents: [],
     payments: [],
     bookings: [],
-    cars: [],
+    cars: seedCars.map((car) => ({ ...car })),
     messages: [],
     sessions: {},
     loginAttempts: {},
+    catalogSeedVersion,
   };
+}
+
+function seedCatalog(value) {
+  if (Number(value.catalogSeedVersion) >= catalogSeedVersion) return false;
+  if (value.cars.length === 0) {
+    value.cars = seedCars.map((car) => ({ ...car }));
+  }
+  value.catalogSeedVersion = catalogSeedVersion;
+  return true;
 }
 
 function normalizeStore(value, source) {
@@ -1040,6 +1353,12 @@ async function handleVercelRequest(req, res) {
         "SELECT data FROM kcr_app_state WHERE id = 1",
       );
       store = normalizeStore(result.rows[0].data, "Neon PostgreSQL");
+      if (seedCatalog(store)) {
+        await client.query(
+          "UPDATE kcr_app_state SET data = $1::jsonb WHERE id = 1",
+          [JSON.stringify(store)],
+        );
+      }
       databaseClient = client;
       await dispatchRequest(req, res);
       await client.query("COMMIT");

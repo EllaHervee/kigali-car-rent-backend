@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
@@ -8,24 +9,39 @@ const test = require("node:test");
 
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
+  const emailMessages = [];
+  const emailServer = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    emailMessages.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ id: "test-email" }));
+  });
+  await new Promise((resolve) => emailServer.listen(0, "127.0.0.1", resolve));
+  const emailApiUrl =
+    "http://127.0.0.1:" + emailServer.address().port + "/emails";
   const server = spawn(
     process.execPath,
     [path.join(__dirname, "../src/legacy-server.js")],
     {
-    env: {
-      ...process.env,
-      ADMIN_EMAIL: "admin@example.com",
-      ADMIN_PASSWORD: "test-admin-password-2026",
-      MTN_MOMO_SUBSCRIPTION_KEY: "",
-      MTN_MOMO_API_USER: "",
-      MTN_MOMO_API_KEY: "",
-      AIRTEL_MONEY_CLIENT_ID: "",
-      AIRTEL_MONEY_CLIENT_SECRET: "",
-      KCR_DATA_DIR: dataDir,
-      PORT: "0",
-      NODE_ENV: "test",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        ADMIN_EMAIL: "admin@example.com",
+        ADMIN_PASSWORD: "test-admin-password-2026",
+        RESEND_API_KEY: "test-resend-key",
+        RESEND_API_URL: emailApiUrl,
+        EMAIL_FROM: "Kigali Car Rent <no-reply@example.com>",
+        APP_BASE_URL: "http://localhost:3000",
+        MTN_MOMO_SUBSCRIPTION_KEY: "",
+        MTN_MOMO_API_USER: "",
+        MTN_MOMO_API_KEY: "",
+        AIRTEL_MONEY_CLIENT_ID: "",
+        AIRTEL_MONEY_CLIENT_SECRET: "",
+        KCR_DATA_DIR: dataDir,
+        PORT: "0",
+        NODE_ENV: "test",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
   let output = "";
@@ -38,6 +54,7 @@ test("server persists accounts and protects admin records", async (t) => {
   t.after(async () => {
     server.kill();
     await once(server, "exit").catch(() => {});
+    await new Promise((resolve) => emailServer.close(resolve));
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
@@ -55,7 +72,9 @@ test("server persists accounts and protects admin records", async (t) => {
       ...options,
       headers: {
         ...(options && options.headers),
-        ...(options && options.body ? { "Content-Type": "application/json" } : {}),
+        ...(options && options.body
+          ? { "Content-Type": "application/json" }
+          : {}),
       },
     });
   const body = (value) => JSON.stringify(value);
@@ -64,6 +83,13 @@ test("server persists accounts and protects admin records", async (t) => {
 
   const unauthenticated = await request("/api/admin/data");
   assert.equal(unauthenticated.status, 401);
+
+  const catalogResponse = await request("/api/cars");
+  assert.equal(catalogResponse.status, 200);
+  const catalog = (await catalogResponse.json()).cars;
+  assert.equal(catalog.length, 30);
+  assert.equal(catalog[0].name, "Toyota Land Cruiser V8");
+  assert.equal(catalog[29].name, "Kia Niro Hybrid");
 
   const noMtnConfig = await request("/api/payments/request", {
     method: "POST",
@@ -161,9 +187,108 @@ test("server persists accounts and protects admin records", async (t) => {
   assert.equal(records.users[0].phone, "0783553434");
   assert.deepEqual(records.payments, []);
   assert.deepEqual(records.bookings, []);
-  assert.deepEqual(records.cars, []);
-  assert.ok(records.authEvents.some((event) => event.action === "Registration succeeded"));
-  assert.ok(records.authEvents.some((event) => event.action === "Customer login failed"));
+  assert.equal(records.cars.length, 30);
+  assert.equal(records.cars[0].name, "Toyota Land Cruiser V8");
+  assert.ok(
+    records.authEvents.some(
+      (event) => event.action === "Registration succeeded",
+    ),
+  );
+  assert.ok(
+    records.authEvents.some(
+      (event) => event.action === "Customer login failed",
+    ),
+  );
+
+  const emailRegistration = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Email Customer",
+      identifier: "New.Customer@Example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(emailRegistration.status, 201);
+  assert.equal(emailRegistration.headers.get("set-cookie"), null);
+  const pendingEmailAccount = await emailRegistration.json();
+  assert.equal(pendingEmailAccount.verificationRequired, true);
+  assert.equal(pendingEmailAccount.email, "new.customer@example.com");
+  assert.equal(emailMessages.length, 1);
+  assert.deepEqual(emailMessages[0].to, ["new.customer@example.com"]);
+  const verificationUrl = new URL(
+    emailMessages[0].text.match(/https?:\/\/\S+/)[0],
+  );
+  assert.equal(verificationUrl.origin, "http://localhost:3000");
+
+  const unverifiedLogin = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "NEW.CUSTOMER@EXAMPLE.COM",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(unverifiedLogin.status, 403);
+  assert.equal((await unverifiedLogin.json()).verificationRequired, true);
+
+  const confirmedEmail = await request(
+    "/api/email-verification/confirm?token=" +
+      encodeURIComponent(verificationUrl.searchParams.get("verifyEmail")),
+  );
+  assert.equal(confirmedEmail.status, 200);
+  const replayedVerification = await request(
+    "/api/email-verification/confirm?token=" +
+      encodeURIComponent(verificationUrl.searchParams.get("verifyEmail")),
+  );
+  assert.equal(replayedVerification.status, 400);
+
+  const resendDuringCooldown = await request(
+    "/api/email-verification/resend",
+    {
+      method: "POST",
+      body: body({ email: "new.customer@example.com" }),
+    },
+  );
+  assert.equal(resendDuringCooldown.status, 200);
+  assert.equal(emailMessages.length, 1);
+
+  const emailLogin = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "NEW.CUSTOMER@EXAMPLE.COM",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(emailLogin.status, 200);
+  const emailAccount = (await emailLogin.json()).user;
+  assert.equal(emailAccount.id, "new.customer@example.com");
+  assert.equal(emailAccount.email, "new.customer@example.com");
+  assert.equal(emailAccount.phone, null);
+  const restoredEmailAccount = await request("/api/me", {
+    headers: { Cookie: cookieFrom(emailLogin) },
+  });
+  assert.equal(
+    (await restoredEmailAccount.json()).user.email,
+    "new.customer@example.com",
+  );
+  const duplicateEmail = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Email Customer",
+      identifier: "NEW.CUSTOMER@example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(duplicateEmail.status, 409);
+
+  const invalidIdentifier = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Invalid Customer",
+      identifier: "not-an-email",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(invalidIdentifier.status, 400);
 
   // Test booking creation and admin management
   const createdBookingRes = await request("/api/bookings", {
@@ -184,12 +309,48 @@ test("server persists accounts and protects admin records", async (t) => {
   const createdBooking = (await createdBookingRes.json()).booking;
   assert.ok(createdBooking.ref.startsWith("KCR-"));
 
-  const adminCookie = cookieFrom(adminLogin);
-  const patchBookingRes = await request("/api/admin/bookings/" + createdBooking.ref, {
-    method: "PATCH",
-    headers: { Cookie: adminCookie },
-    body: body({ status: "Picked up" }),
+  const emailBookingRes = await request("/api/bookings", {
+    method: "POST",
+    headers: { Cookie: cookieFrom(emailLogin) },
+    body: body({
+      car: "Toyota RAV4 Hybrid",
+      name: "Email Customer",
+      phone: "0783999999",
+      d1: "2026-11-12",
+      d2: "2026-11-14",
+      days: 2,
+      total: 180000,
+      paid: 0,
+      loc: "Kigali",
+    }),
   });
+  assert.equal(emailBookingRes.status, 201);
+  const emailBooking = (await emailBookingRes.json()).booking;
+  assert.equal(emailBooking.accountId, emailAccount.id);
+  const emailBookings = await request("/api/bookings", {
+    headers: { Cookie: cookieFrom(emailLogin) },
+  });
+  assert.deepEqual(
+    (await emailBookings.json()).bookings.map((booking) => booking.ref),
+    [emailBooking.ref],
+  );
+  const phoneBookings = await request("/api/bookings", {
+    headers: { Cookie: cookieFrom(loggedIn) },
+  });
+  assert.deepEqual(
+    (await phoneBookings.json()).bookings.map((booking) => booking.ref),
+    [createdBooking.ref],
+  );
+
+  const adminCookie = cookieFrom(adminLogin);
+  const patchBookingRes = await request(
+    "/api/admin/bookings/" + createdBooking.ref,
+    {
+      method: "PATCH",
+      headers: { Cookie: adminCookie },
+      body: body({ status: "Picked up" }),
+    },
+  );
   assert.equal(patchBookingRes.status, 200);
   const patched = (await patchBookingRes.json()).booking;
   assert.equal(patched.status, "Picked up");
@@ -209,8 +370,18 @@ test("server persists accounts and protects admin records", async (t) => {
   const updatedDashboard = await (
     await request("/api/admin/data", { headers: { Cookie: adminCookie } })
   ).json();
-  assert.equal(updatedDashboard.bookings.length, 1);
-  assert.equal(updatedDashboard.bookings[0].status, "Picked up");
+  const emailCustomer = updatedDashboard.users.find(
+    (user) => user.id === emailAccount.id,
+  );
+  assert.equal(emailCustomer.email, "new.customer@example.com");
+  assert.equal(emailCustomer.phone, null);
+  assert.equal(updatedDashboard.bookings.length, 2);
+  assert.equal(
+    updatedDashboard.bookings.find(
+      (booking) => booking.ref === createdBooking.ref,
+    ).status,
+    "Picked up",
+  );
   assert.equal(updatedDashboard.cars[0].status, "Rented");
   const stored = await fs.readFile(path.join(dataDir, "store.json"), "utf8");
   assert.equal(stored.includes("Customer123"), false);

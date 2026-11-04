@@ -15,3 +15,9 @@ services:
         value: iradukundaellaherve@gmail.com
       - key: DATABASE_URL
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
