@@ -161,6 +161,24 @@ test("server persists accounts and protects admin records", async (t) => {
   });
   assert.equal(loggedIn.status, 200);
 
+  const emailRegistered = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Email Customer",
+      identifier: "Test.Customer@example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(emailRegistered.status, 201);
+  const emailLoggedIn = await request("/api/login", {
+    method: "POST",
+    body: body({
+      identifier: "TEST.CUSTOMER@example.com",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(emailLoggedIn.status, 200);
+
   const adminLogin = await request("/api/admin/login", {
     method: "POST",
     body: body({
