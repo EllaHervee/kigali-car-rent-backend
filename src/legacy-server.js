@@ -199,8 +199,12 @@ function sameOrigin(req) {
   }
 }
 
+function clientAddress(req) {
+  return req.ip || req.socket.remoteAddress || "unknown";
+}
+
 async function allowAttempt(req, route) {
-  const key = route + ":" + (req.socket.remoteAddress || "unknown");
+  const key = route + ":" + clientAddress(req);
   const now = Date.now();
   for (const [attemptKey, attempt] of Object.entries(store.loginAttempts)) {
     if (now - attempt.startedAt > 15 * 60 * 1000) {
@@ -219,9 +223,7 @@ async function allowAttempt(req, route) {
 }
 
 async function resetAttempts(req, route) {
-  delete store.loginAttempts[
-    route + ":" + (req.socket.remoteAddress || "unknown")
-  ];
+  delete store.loginAttempts[route + ":" + clientAddress(req)];
   await saveStore();
 }
 
@@ -1189,4 +1191,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { handleVercelRequest };
+module.exports = { clientAddress, handleVercelRequest };

@@ -6,6 +6,21 @@ const path = require("node:path");
 const { once } = require("node:events");
 const test = require("node:test");
 
+test("login attempt keys use the trusted client IP when available", () => {
+  const { clientAddress } = require("../src/legacy-server.js");
+  assert.equal(
+    clientAddress({
+      ip: "198.51.100.10",
+      socket: { remoteAddress: "10.0.0.2" },
+    }),
+    "198.51.100.10",
+  );
+  assert.equal(
+    clientAddress({ socket: { remoteAddress: "127.0.0.1" } }),
+    "127.0.0.1",
+  );
+});
+
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
   const server = spawn(
