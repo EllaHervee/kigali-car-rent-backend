@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const os = require("node:os");
@@ -21,6 +22,76 @@ test("login attempt keys use the trusted client IP when available", () => {
   );
 });
 
+test("Google credentials require a valid signature and verified matching audience", async () => {
+  const { verifyGoogleCredential } = require("../src/legacy-server.js");
+  const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+    modulusLength: 2048,
+  });
+  const oldFetch = global.fetch;
+  const oldClientId = process.env.GOOGLE_CLIENT_ID;
+  const clientId = "test-google-client.apps.googleusercontent.com";
+  process.env.GOOGLE_CLIENT_ID = clientId;
+  global.fetch = async () => ({
+    ok: true,
+    headers: { get: () => "public, max-age=3600" },
+    json: async () => ({
+      keys: [
+        {
+          ...publicKey.export({ format: "jwk" }),
+          kid: "google-test-signing-key",
+          use: "sig",
+          alg: "RS256",
+        },
+      ],
+    }),
+  });
+  try {
+    const encode = (value) =>
+      Buffer.from(JSON.stringify(value)).toString("base64url");
+    const claims = {
+      iss: "https://accounts.google.com",
+      aud: clientId,
+      exp: Math.floor(Date.now() / 1000) + 300,
+      iat: Math.floor(Date.now() / 1000),
+      email_verified: true,
+      sub: "google-user-123",
+      email: "Customer@Example.com",
+      name: "Test Customer",
+    };
+    const makeCredential = (tokenClaims) => {
+      const unsigned = [
+        encode({ alg: "RS256", kid: "google-test-signing-key" }),
+        encode(tokenClaims),
+      ].join(".");
+      return (
+        unsigned +
+        "." +
+        crypto
+          .sign("RSA-SHA256", Buffer.from(unsigned), privateKey)
+          .toString("base64url")
+      );
+    };
+    const credential = makeCredential(claims);
+    assert.deepEqual(await verifyGoogleCredential(credential), {
+      sub: "google-user-123",
+      email: "customer@example.com",
+      name: "Test Customer",
+    });
+    await assert.rejects(
+      verifyGoogleCredential(credential.slice(0, -1) + "x"),
+      /Google could not verify this sign-in/,
+    );
+    await assert.rejects(
+      verifyGoogleCredential(makeCredential({ ...claims, aud: "wrong-client" })),
+      /Google could not verify this sign-in/,
+    );
+  } finally {
+    global.fetch = oldFetch;
+    if (oldClientId === undefined) delete process.env.GOOGLE_CLIENT_ID;
+    else process.env.GOOGLE_CLIENT_ID = oldClientId;
+  }
+});
+
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
   const server = spawn(
@@ -31,6 +102,7 @@ test("server persists accounts and protects admin records", async (t) => {
         ...process.env,
         ADMIN_EMAIL: "admin@example.com",
         ADMIN_PASSWORD: "test-admin-password-2026",
+        GOOGLE_CLIENT_ID: "test-client.apps.googleusercontent.com",
         MTN_MOMO_SUBSCRIPTION_KEY: "",
         MTN_MOMO_API_USER: "",
         MTN_MOMO_API_KEY: "",
@@ -107,6 +179,17 @@ test("server persists accounts and protects admin records", async (t) => {
   assert.equal(catalog.length, 30);
   assert.equal(catalog[0].name, "Toyota Land Cruiser V8");
   assert.equal(catalog[29].name, "Kia Niro Hybrid");
+
+  const googleConfig = await request("/api/auth/google/config");
+  assert.equal(
+    (await googleConfig.json()).clientId,
+    "test-client.apps.googleusercontent.com",
+  );
+  const invalidGoogleCredential = await request("/api/auth/google", {
+    method: "POST",
+    body: body({ credential: "not-a-google-token" }),
+  });
+  assert.equal(invalidGoogleCredential.status, 401);
 
   const noMtnConfig = await request("/api/payments/request", {
     method: "POST",
@@ -326,8 +409,19 @@ test("server persists accounts and protects admin records", async (t) => {
   assert.equal(invalidIdentifier.status, 400);
 
   // Test booking creation and admin management
+  const unauthenticatedBookingRes = await request("/api/bookings", {
+    method: "POST",
+    body: body({
+      car: "Toyota Land Cruiser V8",
+      name: "Test Customer",
+      phone: "0783553434",
+    }),
+  });
+  assert.equal(unauthenticatedBookingRes.status, 401);
+
   const createdBookingRes = await request("/api/bookings", {
     method: "POST",
+    headers: { Cookie: customerLoginCookie },
     body: body({
       car: "Toyota Land Cruiser V8",
       name: "Test Customer",

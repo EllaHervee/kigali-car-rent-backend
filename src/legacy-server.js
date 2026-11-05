@@ -37,6 +37,8 @@ let databaseClient = null;
 let databasePool = null;
 let vercelRequestQueue = Promise.resolve();
 const providerTokens = new Map();
+let googleSigningKeys = null;
+let googleSigningKeysExpiresAt = 0;
 
 function assertAdminPassword() {
   if (!adminPassword || adminPassword.length < 12) {
@@ -129,6 +131,127 @@ function publicUser(identifier, user) {
     phone: user.phone || (isPhone(identifier) ? identifier : null),
     email: user.email || (isEmail(identifier) ? identifier : null),
     joinedAt: user.createdAt,
+  };
+}
+
+function googleAuthError(status, message) {
+  return Object.assign(new Error(message), { status });
+}
+
+async function getGoogleSigningKeys(forceRefresh = false) {
+  if (
+    !forceRefresh &&
+    googleSigningKeys &&
+    googleSigningKeysExpiresAt > Date.now()
+  ) {
+    return googleSigningKeys;
+  }
+  let response;
+  try {
+    response = await fetch("https://www.googleapis.com/oauth2/v3/certs");
+  } catch {
+    throw googleAuthError(503, "Google sign-up is temporarily unavailable.");
+  }
+  if (!response.ok) {
+    throw googleAuthError(503, "Google sign-up is temporarily unavailable.");
+  }
+  let certificateSet;
+  try {
+    certificateSet = await response.json();
+  } catch {
+    throw googleAuthError(503, "Google sign-up is temporarily unavailable.");
+  }
+  if (!Array.isArray(certificateSet.keys)) {
+    throw googleAuthError(503, "Google sign-up is temporarily unavailable.");
+  }
+  const keys = new Map(
+    certificateSet.keys
+      .filter(
+        (key) =>
+          key.kty === "RSA" &&
+          key.use === "sig" &&
+          key.alg === "RS256" &&
+          typeof key.kid === "string",
+      )
+      .map((key) => [key.kid, key]),
+  );
+  if (!keys.size) {
+    throw googleAuthError(503, "Google sign-up is temporarily unavailable.");
+  }
+  const maxAge = response.headers
+    .get("cache-control")
+    ?.match(/max-age=(\d+)/i);
+  googleSigningKeys = keys;
+  googleSigningKeysExpiresAt =
+    Date.now() + (maxAge ? Number(maxAge[1]) * 1000 : 5 * 60 * 1000);
+  return googleSigningKeys;
+}
+
+async function verifyGoogleCredential(credential) {
+  const clientId = process.env.GOOGLE_CLIENT_ID?.trim();
+  if (!clientId) {
+    throw googleAuthError(503, "Google sign-up is not configured.");
+  }
+  if (typeof credential !== "string" || credential.length > 10000) {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  const parts = credential.split(".");
+  if (parts.length !== 3) {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  let header;
+  let claims;
+  try {
+    header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+    claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  if (header.alg !== "RS256" || typeof header.kid !== "string") {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  let key = (await getGoogleSigningKeys()).get(header.kid);
+  if (!key) {
+    key = (await getGoogleSigningKeys(true)).get(header.kid);
+  }
+  if (!key) {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  const signedData = Buffer.from(parts[0] + "." + parts[1]);
+  const signature = Buffer.from(parts[2], "base64url");
+  let signatureIsValid = false;
+  try {
+    signatureIsValid = crypto.verify(
+      "RSA-SHA256",
+      signedData,
+      crypto.createPublicKey({ key, format: "jwk" }),
+      signature,
+    );
+  } catch {
+    signatureIsValid = false;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  if (
+    !signatureIsValid ||
+    !["accounts.google.com", "https://accounts.google.com"].includes(
+      claims.iss,
+    ) ||
+    claims.aud !== clientId ||
+    !Number.isFinite(claims.exp) ||
+    claims.exp <= now ||
+    !Number.isFinite(claims.iat) ||
+    claims.iat > now + 60 ||
+    claims.email_verified !== true ||
+    typeof claims.sub !== "string" ||
+    claims.sub.length > 255 ||
+    !isEmail(normalizeEmail(claims.email))
+  ) {
+    throw googleAuthError(401, "Google could not verify this sign-in.");
+  }
+  return {
+    sub: claims.sub,
+    email: normalizeEmail(claims.email),
+    name: String(claims.name || "").trim().slice(0, 100),
   };
 }
 
@@ -492,6 +615,12 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true });
   }
 
+  if (req.method === "GET" && url.pathname === "/api/auth/google/config") {
+    return json(res, 200, {
+      clientId: process.env.GOOGLE_CLIENT_ID?.trim() || null,
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/api/cars") {
     return json(res, 200, { cars: store.cars });
   }
@@ -591,6 +720,56 @@ async function handleApi(req, res, url) {
       );
     } catch (e) {
       return error(res, e.status || 400, e.message);
+    }
+
+    if (url.pathname === "/api/auth/google") {
+      if (!(await allowAttempt(req, "google-auth"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      let identity;
+      try {
+        identity = await verifyGoogleCredential(body.credential);
+      } catch (e) {
+        return error(
+          res,
+          e.status || 401,
+          e.message || "Google could not verify this sign-in.",
+        );
+      }
+      if (identity.email === adminEmail) {
+        return error(
+          res,
+          409,
+          "This email address is reserved for the administrator.",
+        );
+      }
+      const existingUser = store.users[identity.email];
+      if (existingUser && existingUser.googleSub !== identity.sub) {
+        await logEvent("Google sign-in rejected", identity.email);
+        return error(
+          res,
+          409,
+          "This email already has an account. Log in using its existing method.",
+        );
+      }
+      const isNewUser = !existingUser;
+      const user = existingUser || {
+        name: identity.name || identity.email.split("@")[0],
+        phone: null,
+        email: identity.email,
+        googleSub: identity.sub,
+        createdAt: Date.now(),
+      };
+      if (isNewUser) store.users[identity.email] = user;
+      await logEvent(
+        isNewUser ? "Google registration succeeded" : "Google login succeeded",
+        identity.email,
+      );
+      await resetAttempts(req, "google-auth");
+      await createSession(res, "customer", identity.email);
+      return json(res, isNewUser ? 201 : 200, {
+        user: { ...publicUser(identity.email, user), role: "customer" },
+      });
     }
 
     if (url.pathname === "/api/register") {
@@ -713,10 +892,15 @@ async function handleApi(req, res, url) {
       const user = store.users[identifier];
       const calculatedHash = await passwordHash(
         password,
-        user ? user.salt : "kcr-invalid-account-salt",
+        user && typeof user.salt === "string"
+          ? user.salt
+          : "kcr-invalid-account-salt",
       );
       const valid =
-        user && secureEqual(calculatedHash, Buffer.from(user.hash, "hex"));
+        user &&
+        typeof user.salt === "string" &&
+        typeof user.hash === "string" &&
+        secureEqual(calculatedHash, Buffer.from(user.hash, "hex"));
       if (!valid) {
         await logEvent("Customer login failed", identifier);
         return error(res, 401, "Wrong email or phone number and password.");
@@ -815,6 +999,14 @@ async function handleApi(req, res, url) {
     }
 
     if (url.pathname === "/api/bookings") {
+      const session = await getSession(req);
+      if (
+        !session ||
+        (session.role === "customer" && !store.users[session.phone])
+      ) {
+        return error(res, 401, "Log in or create an account before booking.");
+      }
+
       const car = String(body.car || "")
         .slice(0, 100)
         .trim();
@@ -864,7 +1056,6 @@ async function handleApi(req, res, url) {
         status,
         createdAt: Date.now(),
       };
-      const session = await getSession(req);
       if (session?.role === "customer" && store.users[session.phone]) {
         booking.accountId = session.phone;
       }
@@ -1271,4 +1462,8 @@ if (require.main === module) {
   });
 }
 
-module.exports = { clientAddress, handleVercelRequest };
+module.exports = {
+  clientAddress,
+  handleVercelRequest,
+  verifyGoogleCredential,
+};
