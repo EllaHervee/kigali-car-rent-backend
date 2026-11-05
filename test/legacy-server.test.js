@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
+const { createServer } = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const { once } = require("node:events");
@@ -20,6 +21,42 @@ test("login attempt keys use the trusted client IP when available", () => {
     clientAddress({ socket: { remoteAddress: "127.0.0.1" } }),
     "127.0.0.1",
   );
+});
+
+test("expired account purge preserves bookings and payment records", async () => {
+  const { purgeExpiredAccounts } = require("../src/legacy-server.js");
+  const expiredIdentifier = "expired@example.com";
+  const data = {
+    users: {
+      [expiredIdentifier]: {
+        deletionScheduledAt: Date.now() - 1,
+      },
+      "active@example.com": {
+        deletionScheduledAt: Date.now() + 1000,
+      },
+    },
+    authEvents: [{ phone: expiredIdentifier }, { phone: "active@example.com" }],
+    sessions: {
+      expired: { role: "customer", phone: expiredIdentifier },
+      active: { role: "customer", phone: "active@example.com" },
+    },
+    emailVerifications: {
+      expired: { identifier: expiredIdentifier },
+      active: { identifier: "active@example.com" },
+    },
+    bookings: [{ accountId: expiredIdentifier }],
+    payments: [{ accountId: expiredIdentifier }],
+  };
+  await purgeExpiredAccounts(data);
+  assert.equal(data.users[expiredIdentifier], undefined);
+  assert.ok(data.users["active@example.com"]);
+  assert.deepEqual(data.authEvents, [{ phone: "active@example.com" }]);
+  assert.equal(data.sessions.expired, undefined);
+  assert.ok(data.sessions.active);
+  assert.equal(data.emailVerifications.expired, undefined);
+  assert.ok(data.emailVerifications.active);
+  assert.equal(data.bookings[0].accountId, expiredIdentifier);
+  assert.equal(data.payments[0].accountId, expiredIdentifier);
 });
 
 test("Google credentials require a valid signature and verified matching audience", async () => {
@@ -77,8 +114,12 @@ test("Google credentials require a valid signature and verified matching audienc
       email: "customer@example.com",
       name: "Test Customer",
     });
+    const tamperedParts = credential.split(".");
+    tamperedParts[2] =
+      (tamperedParts[2][0] === "A" ? "B" : "A") +
+      tamperedParts[2].slice(1);
     await assert.rejects(
-      verifyGoogleCredential(credential.slice(0, -1) + "x"),
+      verifyGoogleCredential(tamperedParts.join(".")),
       /Google could not verify this sign-in/,
     );
     await assert.rejects(
@@ -94,6 +135,24 @@ test("Google credentials require a valid signature and verified matching audienc
 
 test("server persists accounts and protects admin records", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "kcr-backend-"));
+  const outboundEmails = [];
+  const mailServer = createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      if (req.headers.authorization !== "Bearer test-resend-key") {
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+      outboundEmails.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ id: "test-email-id" }));
+    });
+  });
+  mailServer.listen(0, "127.0.0.1");
+  await once(mailServer, "listening");
+  const mailPort = mailServer.address().port;
   const server = spawn(
     process.execPath,
     [path.join(__dirname, "../src/legacy-server.js")],
@@ -103,6 +162,10 @@ test("server persists accounts and protects admin records", async (t) => {
         ADMIN_EMAIL: "admin@example.com",
         ADMIN_PASSWORD: "test-admin-password-2026",
         GOOGLE_CLIENT_ID: "test-client.apps.googleusercontent.com",
+        RESEND_API_KEY: "test-resend-key",
+        AUTH_EMAIL_FROM: "Kigali Car Rent <onboarding@resend.dev>",
+        RESEND_API_URL: "http://127.0.0.1:" + mailPort + "/emails",
+        FRONTEND_URL: "http://localhost:3000",
         MTN_MOMO_SUBSCRIPTION_KEY: "",
         MTN_MOMO_API_USER: "",
         MTN_MOMO_API_KEY: "",
@@ -125,6 +188,7 @@ test("server persists accounts and protects admin records", async (t) => {
   t.after(async () => {
     server.kill();
     await once(server, "exit").catch(() => {});
+    await new Promise((resolve) => mailServer.close(resolve));
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
@@ -150,6 +214,25 @@ test("server persists accounts and protects admin records", async (t) => {
   const body = (value) => JSON.stringify(value);
   const cookieFrom = (response) =>
     response.headers.get("set-cookie").split(";")[0];
+  const verifyLinkFrom = (email) => {
+    const message = outboundEmails
+      .slice()
+      .reverse()
+      .find((item) => item.to.includes(email));
+    assert.ok(message, "a verification email should be sent to " + email);
+    const link = message.text.match(
+      /http:\/\/localhost:3000\/index\.html\?verify_email=\S+/,
+    );
+    assert.ok(link, "email should contain an account verification link");
+    return new URL(link[0]);
+  };
+  const verifyEmail = async (email) => {
+    const link = verifyLinkFrom(email);
+    return request("/api/auth/verify-email", {
+      method: "POST",
+      body: body({ token: link.searchParams.get("verify_email") }),
+    });
+  };
 
   const oversizedLoginRes = await request("/api/login", {
     method: "POST",
@@ -222,16 +305,49 @@ test("server persists accounts and protects admin records", async (t) => {
   });
   assert.equal(weakPassword.status, 400);
 
+  const phoneWithoutEmail = await request("/api/register", {
+    method: "POST",
+    body: body({
+      name: "Phone Customer",
+      phone: "0783553435",
+      password: "Customer123",
+    }),
+  });
+  assert.equal(phoneWithoutEmail.status, 400);
+
   const registered = await request("/api/register", {
     method: "POST",
     body: body({
       name: "Test Customer",
       phone: "0783553434",
+      email: "Phone.Customer@example.com",
       password: "Customer123",
     }),
   });
-  assert.equal(registered.status, 201);
-  const customerCookie = cookieFrom(registered);
+  assert.equal(registered.status, 202);
+  assert.equal((await registered.json()).verificationRequired, true);
+  const firstVerificationToken = verifyLinkFrom(
+    "phone.customer@example.com",
+  ).searchParams.get("verify_email");
+  const unverifiedLogin = await request("/api/login", {
+    method: "POST",
+    body: body({ phone: "0783553434", password: "Customer123" }),
+  });
+  assert.equal(unverifiedLogin.status, 403);
+  assert.equal((await unverifiedLogin.json()).verificationRequired, true);
+  const resendVerification = await request("/api/auth/email/resend", {
+    method: "POST",
+    body: body({ identifier: "0783553434" }),
+  });
+  assert.equal(resendVerification.status, 200);
+  const staleVerification = await request("/api/auth/verify-email", {
+    method: "POST",
+    body: body({ token: firstVerificationToken }),
+  });
+  assert.equal(staleVerification.status, 400);
+  const customerVerification = await verifyEmail("phone.customer@example.com");
+  assert.equal(customerVerification.status, 200);
+  const customerCookie = cookieFrom(customerVerification);
   assert.equal(
     (
       await (
@@ -283,7 +399,11 @@ test("server persists accounts and protects admin records", async (t) => {
       password: "Customer123",
     }),
   });
-  assert.equal(emailRegistered.status, 201);
+  assert.equal(emailRegistered.status, 202);
+  const emailRegistrationVerification = await verifyEmail(
+    "test.customer@example.com",
+  );
+  assert.equal(emailRegistrationVerification.status, 200);
   const emailLoggedIn = await request("/api/login", {
     method: "POST",
     body: body({
@@ -302,6 +422,12 @@ test("server persists accounts and protects admin records", async (t) => {
   });
   assert.equal(adminLogin.status, 200);
   assert.equal((await adminLogin.json()).user.role, "admin");
+  assert.ok(
+    outboundEmails.some(
+      (message) => message.to[0] === "admin@example.com",
+    ),
+    "successful admin login should email the administrator",
+  );
   const adminProfileUpdate = await request("/api/me", {
     method: "POST",
     headers: { Cookie: cookieFrom(adminLogin) },
@@ -350,12 +476,21 @@ test("server persists accounts and protects admin records", async (t) => {
   assert.equal(records.cars[0].name, "Toyota Land Cruiser V8");
   assert.ok(
     records.authEvents.some(
-      (event) => event.action === "Registration succeeded",
+      (event) =>
+        event.action === "Registration pending email verification",
     ),
   );
   assert.ok(
     records.authEvents.some(
       (event) => event.action === "Customer login failed",
+    ),
+  );
+  assert.ok(
+    records.authEvents.some((event) => event.action === "Customer logged in"),
+  );
+  assert.ok(
+    records.authEvents.every(
+      (event) => !String(event.action).startsWith("Admin login"),
     ),
   );
 
@@ -367,14 +502,16 @@ test("server persists accounts and protects admin records", async (t) => {
       password: "Customer123",
     }),
   });
-  assert.equal(emailRegistration.status, 201);
-  const emailAccount = (await emailRegistration.json()).user;
+  assert.equal(emailRegistration.status, 202);
+  const emailVerification = await verifyEmail("new.customer@example.com");
+  assert.equal(emailVerification.status, 200);
+  const emailAccount = (await emailVerification.json()).user;
   assert.equal(emailAccount.id, "new.customer@example.com");
   assert.equal(emailAccount.email, "new.customer@example.com");
   assert.equal(emailAccount.phone, null);
-  assert.ok(cookieFrom(emailRegistration).startsWith("kcr_session="));
+  assert.ok(cookieFrom(emailVerification).startsWith("kcr_session="));
   const restoredEmailAccount = await request("/api/me", {
-    headers: { Cookie: cookieFrom(emailRegistration) },
+    headers: { Cookie: cookieFrom(emailVerification) },
   });
   assert.equal(
     (await restoredEmailAccount.json()).user.email,
@@ -537,30 +674,49 @@ test("server persists accounts and protects admin records", async (t) => {
     headers: { Cookie: customerLoginCookie },
   });
   assert.equal(accountDeletion.status, 200);
-  assert.deepEqual(await accountDeletion.json(), { ok: true });
-  assert.match(accountDeletion.headers.get("set-cookie"), /Max-Age=0/);
+  const scheduledDeletion = await accountDeletion.json();
+  assert.equal(scheduledDeletion.ok, true);
+  assert.ok(
+    scheduledDeletion.deletionScheduledAt >=
+      Date.now() + 30 * 24 * 60 * 60 * 1000 - 1000,
+  );
+  const scheduledAccount = await request("/api/me", {
+    headers: { Cookie: customerLoginCookie },
+  });
   assert.equal(
+    (await scheduledAccount.json()).user.deletionScheduledAt,
+    scheduledDeletion.deletionScheduledAt,
+  );
+  const cancelledDeletion = await request("/api/me/cancel-deletion", {
+    method: "POST",
+    headers: { Cookie: cookieFrom(secondPhoneLogin) },
+    body: body({}),
+  });
+  assert.equal(cancelledDeletion.status, 200);
+  assert.equal((await cancelledDeletion.json()).deletionScheduledAt, null);
+  const rescheduledDeletion = await request("/api/me", {
+    method: "DELETE",
+    headers: { Cookie: customerLoginCookie },
+  });
+  assert.equal(rescheduledDeletion.status, 200);
+  assert.ok(
     (await (
       await request("/api/me", { headers: { Cookie: customerLoginCookie } })
-    ).json()).user,
-    null,
-  );
-  assert.equal(
-    (await (
-      await request("/api/me", {
-        headers: { Cookie: cookieFrom(secondPhoneLogin) },
-      })
-    ).json()).user,
-    null,
+    ).json()).user.deletionScheduledAt,
   );
   const afterAccountDeletion = await (
     await request("/api/admin/data", { headers: { Cookie: adminCookie } })
   ).json();
   assert.equal(
     afterAccountDeletion.users.some((user) => user.phone === "0783553434"),
-    false,
+    true,
   );
   assert.equal(afterAccountDeletion.bookings.length, 2);
+  assert.ok(
+    afterAccountDeletion.bookings.some(
+      (booking) => booking.ref === createdBooking.ref,
+    ),
+  );
 
   const adminPage = await request("/admin");
   assert.equal(adminPage.status, 200);

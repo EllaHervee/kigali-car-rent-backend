@@ -25,6 +25,8 @@ const dataDir = process.env.KCR_DATA_DIR || path.join(root, "data");
 const storePath = path.join(dataDir, "store.json");
 const port = Number(process.env.PORT || 3000);
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
+const emailVerificationLifetime = 24 * 60 * 60 * 1000;
+const accountDeletionGracePeriod = 30 * 24 * 60 * 60 * 1000;
 const adminEmail =
   process.env.ADMIN_EMAIL?.trim().toLowerCase() ||
   (process.env.NODE_ENV === "production" ? "" : "admin@example.com");
@@ -131,6 +133,7 @@ function publicUser(identifier, user) {
     phone: user.phone || (isPhone(identifier) ? identifier : null),
     email: user.email || (isEmail(identifier) ? identifier : null),
     joinedAt: user.createdAt,
+    deletionScheduledAt: user.deletionScheduledAt || null,
   };
 }
 
@@ -267,6 +270,106 @@ function logEvent(action, identifier) {
   return saveStore();
 }
 
+async function sendResendEmail({ to, subject, html, text }) {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  const from = process.env.AUTH_EMAIL_FROM?.trim();
+  if (!apiKey || !from) {
+    throw new Error(
+      "Email delivery is not configured. Set RESEND_API_KEY and AUTH_EMAIL_FROM.",
+    );
+  }
+  let response;
+  try {
+    response = await fetch(
+      process.env.RESEND_API_URL || "https://api.resend.com/emails",
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(8000),
+        headers: {
+          Authorization: "Bearer " + apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ from, to: [to], subject, html, text }),
+      },
+    );
+  } catch (e) {
+    throw new Error("Email delivery failed: " + e.message);
+  }
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(
+      "Email delivery failed (HTTP " +
+        response.status +
+        ")" +
+        (details ? ": " + details.slice(0, 300) : "."),
+    );
+  }
+}
+
+function verificationUrl(token) {
+  const frontendUrl = new URL(
+    process.env.FRONTEND_URL || "http://localhost:3000",
+  );
+  frontendUrl.pathname = "/index.html";
+  frontendUrl.search = "";
+  frontendUrl.hash = "";
+  frontendUrl.searchParams.set("verify_email", token);
+  return frontendUrl.toString();
+}
+
+async function sendEmailVerification(identifier) {
+  const user = store.users[identifier];
+  if (!user || !user.email) {
+    throw new Error("This account does not have an email address.");
+  }
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  for (const [hash, verification] of Object.entries(store.emailVerifications)) {
+    if (verification.identifier === identifier) {
+      delete store.emailVerifications[hash];
+    }
+  }
+  store.emailVerifications[tokenHash] = {
+    identifier,
+    expiresAt: Date.now() + emailVerificationLifetime,
+  };
+  await saveStore();
+  const link = verificationUrl(token);
+  await sendResendEmail({
+    to: user.email,
+    subject: "Verify your Kigali Car Rent account",
+    text:
+      "Confirm your email address to activate your Kigali Car Rent account: " +
+      link +
+      "\n\nThis link expires in 24 hours. If you did not create this account, you can ignore this email.",
+    html:
+      "<p>Hello,</p><p>Confirm your email address to activate your Kigali Car Rent account.</p><p><a href=\"" +
+      link +
+      "\">Verify my email</a></p><p>This link expires in 24 hours. If you did not create this account, you can ignore this email.</p>",
+  });
+}
+
+async function sendAdminLoginAlert() {
+  if (!adminEmail) {
+    console.error("Could not send admin login alert: ADMIN_EMAIL is not set.");
+    return;
+  }
+  try {
+    const timestamp = new Date().toISOString();
+    await sendResendEmail({
+      to: adminEmail,
+      subject: "Kigali Car Rent administrator login",
+      text: "A successful administrator login occurred at " + timestamp + ".",
+      html:
+        "<p>A successful administrator login occurred at " +
+        timestamp +
+        ".</p>",
+    });
+  } catch (e) {
+    console.error("Could not send admin login alert:", e.message);
+  }
+}
+
 function saveStore() {
   if (databaseClient) {
     return databaseClient.query(
@@ -282,6 +385,39 @@ function saveStore() {
     await fs.rename(temporaryPath, storePath);
   });
   return writeQueue;
+}
+
+async function purgeExpiredAccounts(targetStore = store) {
+  const now = Date.now();
+  const deletedIdentifiers = [];
+  for (const [identifier, user] of Object.entries(targetStore.users)) {
+    if (
+      Number.isFinite(user.deletionScheduledAt) &&
+      user.deletionScheduledAt <= now
+    ) {
+      delete targetStore.users[identifier];
+      deletedIdentifiers.push(identifier);
+    }
+  }
+  if (!deletedIdentifiers.length) return;
+
+  const deletedSet = new Set(deletedIdentifiers);
+  targetStore.authEvents = targetStore.authEvents.filter(
+    (event) => !deletedSet.has(event.phone),
+  );
+  for (const [token, session] of Object.entries(targetStore.sessions)) {
+    if (session.role === "customer" && deletedSet.has(session.phone)) {
+      delete targetStore.sessions[token];
+    }
+  }
+  for (const [tokenHash, verification] of Object.entries(
+    targetStore.emailVerifications,
+  )) {
+    if (deletedSet.has(verification.identifier)) {
+      delete targetStore.emailVerifications[tokenHash];
+    }
+  }
+  if (targetStore === store) await saveStore();
 }
 
 async function readJson(req, maxLength = 8192) {
@@ -695,18 +831,19 @@ async function handleApi(req, res, url) {
     if (!store.users[identifier]) {
       return error(res, 404, "Customer account was not found.");
     }
-    delete store.users[identifier];
-    for (const [token, accountSession] of Object.entries(store.sessions)) {
-      if (
-        accountSession.role === "customer" &&
-        accountSession.phone === identifier
-      ) {
-        delete store.sessions[token];
-      }
+    const user = store.users[identifier];
+    if (Number.isFinite(user.deletionScheduledAt)) {
+      return json(res, 200, {
+        ok: true,
+        deletionScheduledAt: user.deletionScheduledAt,
+      });
     }
-    await saveStore();
-    res.setHeader("Set-Cookie", cookieOptions(null));
-    return json(res, 200, { ok: true });
+    user.deletionScheduledAt = Date.now() + accountDeletionGracePeriod;
+    await logEvent("Customer account deletion scheduled", identifier);
+    return json(res, 200, {
+      ok: true,
+      deletionScheduledAt: user.deletionScheduledAt,
+    });
   }
 
   if (req.method === "POST") {
@@ -720,6 +857,23 @@ async function handleApi(req, res, url) {
       );
     } catch (e) {
       return error(res, e.status || 400, e.message);
+    }
+
+    if (url.pathname === "/api/me/cancel-deletion") {
+      const session = await getSession(req);
+      if (!session || session.role !== "customer") {
+        return error(res, 401, "Customer login is required.");
+      }
+      const user = store.users[session.phone];
+      if (!user) {
+        return error(res, 404, "Customer account was not found.");
+      }
+      if (!Number.isFinite(user.deletionScheduledAt)) {
+        return error(res, 409, "This account has no pending deletion request.");
+      }
+      delete user.deletionScheduledAt;
+      await logEvent("Customer account deletion cancelled", session.phone);
+      return json(res, 200, { ok: true, deletionScheduledAt: null });
     }
 
     if (url.pathname === "/api/auth/google") {
@@ -758,17 +912,93 @@ async function handleApi(req, res, url) {
         phone: null,
         email: identity.email,
         googleSub: identity.sub,
+        emailVerified: true,
         createdAt: Date.now(),
       };
       if (isNewUser) store.users[identity.email] = user;
       await logEvent(
-        isNewUser ? "Google registration succeeded" : "Google login succeeded",
+        isNewUser
+          ? "Customer registered with Google"
+          : "Customer logged in with Google",
         identity.email,
       );
       await resetAttempts(req, "google-auth");
       await createSession(res, "customer", identity.email);
       return json(res, isNewUser ? 201 : 200, {
         user: { ...publicUser(identity.email, user), role: "customer" },
+      });
+    }
+
+    if (url.pathname === "/api/auth/email/resend") {
+      if (!(await allowAttempt(req, "email-verification"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      const suppliedIdentifier = String(
+        body.identifier || body.email || body.phone || "",
+      ).trim();
+      const identifier = suppliedIdentifier.includes("@")
+        ? normalizeEmail(suppliedIdentifier)
+        : normalizePhone(suppliedIdentifier);
+      const user = store.users[identifier];
+      if (user && user.email && user.emailVerified !== true) {
+        try {
+          await sendEmailVerification(identifier);
+        } catch (e) {
+          console.error("Could not send account verification email:", e);
+          return error(res, 503, "Could not send the verification email. Try again later.");
+        }
+      }
+      return json(res, 200, {
+        message:
+          "If this account needs email verification, a new link has been sent.",
+      });
+    }
+
+    if (url.pathname === "/api/auth/verify-email") {
+      if (!(await allowAttempt(req, "verify-email"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      const token =
+        typeof body.token === "string" ? body.token.toLowerCase() : "";
+      if (!/^[a-f0-9]{64}$/.test(token)) {
+        return error(res, 400, "This verification link is invalid or expired.");
+      }
+      const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+      const verification = store.emailVerifications[tokenHash];
+      if (!verification || verification.expiresAt <= Date.now()) {
+        if (verification) {
+          delete store.emailVerifications[tokenHash];
+          await saveStore();
+        }
+        return error(res, 400, "This verification link is invalid or expired.");
+      }
+      const user = store.users[verification.identifier];
+      if (!user || !user.email) {
+        delete store.emailVerifications[tokenHash];
+        await saveStore();
+        return error(res, 400, "This verification link is invalid or expired.");
+      }
+      if (Number.isFinite(user.deletionScheduledAt)) {
+        return error(
+          res,
+          403,
+          "This account is scheduled for deletion. Log in to cancel the request.",
+        );
+      }
+      user.emailVerified = true;
+      for (const [hash, entry] of Object.entries(store.emailVerifications)) {
+        if (entry.identifier === verification.identifier) {
+          delete store.emailVerifications[hash];
+        }
+      }
+      await logEvent("Customer logged in", verification.identifier);
+      await resetAttempts(req, "verify-email");
+      await createSession(res, "customer", verification.identifier);
+      return json(res, 200, {
+        user: {
+          ...publicUser(verification.identifier, user),
+          role: "customer",
+        },
       });
     }
 
@@ -782,18 +1012,24 @@ async function handleApi(req, res, url) {
       const rawIdentifier = String(suppliedIdentifier || "").trim();
       const email = rawIdentifier.includes("@")
         ? normalizeEmail(rawIdentifier)
-        : "";
+        : normalizeEmail(body.email || "");
       const phone = email ? "" : normalizePhone(rawIdentifier);
-      const identifier = email || phone;
+      const identifier = rawIdentifier.includes("@")
+        ? email
+        : normalizePhone(rawIdentifier);
       const password = String(body.password || "");
       if (!name || name.length > 100) {
         return error(res, 400, "Enter a name of at most 100 characters.");
       }
-      if (!isEmail(email) && !isPhone(phone)) {
+      if (
+        (rawIdentifier.includes("@") && !isEmail(email)) ||
+        (!rawIdentifier.includes("@") &&
+          (!isPhone(identifier) || !isEmail(email)))
+      ) {
         return error(
           res,
           400,
-          "Enter a valid email address or Rwanda mobile number.",
+          "Enter a valid email address, or a Rwanda mobile number and email address.",
         );
       }
       if (email && email === adminEmail) {
@@ -829,6 +1065,15 @@ async function handleApi(req, res, url) {
           "This email address or number already has an account. Please log in.",
         );
       }
+      if (
+        Object.entries(store.users).some(
+          ([existingIdentifier, existingUser]) =>
+            existingIdentifier !== identifier &&
+            normalizeEmail(existingUser.email || "") === email,
+        )
+      ) {
+        return error(res, 409, "This email address is already in use.");
+      }
       const salt = crypto.randomBytes(16).toString("hex");
       const hash = (await passwordHash(password, salt)).toString("hex");
       if (store.users[identifier]) {
@@ -841,21 +1086,29 @@ async function handleApi(req, res, url) {
       }
       const user = {
         name,
-        phone: phone || null,
-        email: email || null,
+        phone: rawIdentifier.includes("@") ? null : identifier,
+        email,
+        emailVerified: false,
         salt,
         hash,
         createdAt: Date.now(),
       };
       store.users[identifier] = user;
-      await logEvent("Registration succeeded", identifier);
+      await logEvent("Registration pending email verification", identifier);
       await resetAttempts(req, "register");
-      await createSession(res, "customer", identifier);
-      return json(res, 201, {
-        user: {
-          ...publicUser(identifier, store.users[identifier]),
-          role: "customer",
-        },
+      try {
+        await sendEmailVerification(identifier);
+      } catch (e) {
+        console.error("Could not send account verification email:", e);
+        return error(
+          res,
+          503,
+          "Your account is pending email verification, but the verification email could not be sent. Please try resending the link.",
+        );
+      }
+      return json(res, 202, {
+        verificationRequired: true,
+        email: user.email,
       });
     }
 
@@ -874,12 +1127,11 @@ async function handleApi(req, res, url) {
       }
       if (adminLogin) {
         if (!validAdminCredentials(identifier, password)) {
-          await logEvent("Admin login failed");
           return error(res, 401, "Wrong email or phone number and password.");
         }
         await resetAttempts(req, attemptRoute);
-        await logEvent("Admin login succeeded");
         await createSession(res, "admin");
+        await sendAdminLoginAlert();
         return json(res, 200, { user: { role: "admin" } });
       }
       if (
@@ -905,8 +1157,14 @@ async function handleApi(req, res, url) {
         await logEvent("Customer login failed", identifier);
         return error(res, 401, "Wrong email or phone number and password.");
       }
+      if (user.email && user.emailVerified === false) {
+        return json(res, 403, {
+          error: "Verify your email address before logging in.",
+          verificationRequired: true,
+        });
+      }
       await resetAttempts(req, "login");
-      await logEvent("Customer login succeeded", identifier);
+      await logEvent("Customer logged in", identifier);
       await createSession(res, "customer", identifier);
       return json(res, 200, {
         user: { ...publicUser(identifier, user), role: "customer" },
@@ -920,12 +1178,11 @@ async function handleApi(req, res, url) {
       const email = normalizeEmail(body.email);
       const password = String(body.password || "");
       if (!validAdminCredentials(email, password)) {
-        await logEvent("Admin login failed");
         return error(res, 401, "Wrong admin email or password.");
       }
       await resetAttempts(req, "admin-login");
-      await logEvent("Admin login succeeded");
       await createSession(res, "admin");
+      await sendAdminLoginAlert();
       return json(res, 200, { user: { role: "admin" } });
     }
 
@@ -1233,7 +1490,9 @@ async function handleApi(req, res, url) {
       users: Object.keys(store.users).map((identifier) =>
         publicUser(identifier, store.users[identifier]),
       ),
-      authEvents: store.authEvents,
+      authEvents: store.authEvents.filter(
+        (event) => !String(event.action).startsWith("Admin login"),
+      ),
       payments: store.payments.map(adminPayment),
       bookings: store.bookings,
       cars: store.cars,
@@ -1295,6 +1554,7 @@ function emptyStore() {
     messages: [],
     sessions: {},
     loginAttempts: {},
+    emailVerifications: {},
     catalogSeedVersion,
   };
 }
@@ -1327,6 +1587,12 @@ function normalizeStore(value, source) {
   if (!value.loginAttempts || typeof value.loginAttempts !== "object") {
     value.loginAttempts = {};
   }
+  if (
+    !value.emailVerifications ||
+    typeof value.emailVerifications !== "object"
+  ) {
+    value.emailVerifications = {};
+  }
   return value;
 }
 
@@ -1355,6 +1621,7 @@ function getDatabasePool() {
 }
 
 async function dispatchRequest(req, res) {
+  await purgeExpiredAccounts();
   const url = new URL(req.url, "http://" + (req.headers.host || "localhost"));
   if (url.pathname.startsWith("/api/")) {
     await handleApi(req, res, url);
@@ -1434,6 +1701,13 @@ async function start() {
     );
   }
   await loadFileStore();
+  await purgeExpiredAccounts();
+  const accountCleanupTimer = setInterval(() => {
+    purgeExpiredAccounts().catch((e) => {
+      console.error("Could not purge expired customer accounts:", e);
+    });
+  }, 60 * 60 * 1000);
+  accountCleanupTimer.unref();
 
   const server = http.createServer((req, res) => {
     dispatchRequest(req, res).catch((e) => {
@@ -1465,5 +1739,6 @@ if (require.main === module) {
 module.exports = {
   clientAddress,
   handleVercelRequest,
+  purgeExpiredAccounts,
   verifyGoogleCredential,
 };

@@ -15,5 +15,11 @@ services:
         value: iradukundaellaherve@gmail.com
       - key: GOOGLE_CLIENT_ID
         value: 251028173214-i4mogud2a6rvhnm3hucekdcsliut8v2a.apps.googleusercontent.com
+      - key: FRONTEND_URL
+        value: https://kigali-car-rent-frontend.vercel.app
+      - key: RESEND_API_KEY
+        sync: false
+      - key: AUTH_EMAIL_FROM
+        sync: false
       - key: DATABASE_URL
         sync: false
