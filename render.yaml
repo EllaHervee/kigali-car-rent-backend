@@ -13,5 +13,7 @@ services:
         sync: false
       - key: ADMIN_EMAIL
         value: iradukundaellaherve@gmail.com
+      - key: GOOGLE_CLIENT_ID
+        value: 251028173214-i4mogud2a6rvhnm3hucekdcsliut8v2a.apps.googleusercontent.com
       - key: DATABASE_URL
         sync: false
