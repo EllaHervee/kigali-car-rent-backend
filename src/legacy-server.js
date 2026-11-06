@@ -862,7 +862,7 @@ async function handleApi(req, res, url) {
       return error(res, 404, "Vehicle not found.");
     }
     const [removedCar] = store.cars.splice(carIndex, 1);
-    await logEvent("Car removed from fleet: " + (removedCar.name || id));
+    await logEvent("Car removed by admin: " + (removedCar.name || id));
     await saveStore();
     return json(res, 200, { ok: true, id });
   }
