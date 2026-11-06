@@ -847,6 +847,26 @@ async function handleApi(req, res, url) {
     });
   }
 
+  const adminCarMatch = url.pathname.match(/^\/api\/admin\/cars\/(\d+)$/);
+  if (req.method === "DELETE" && adminCarMatch) {
+    if (!sameOrigin(req)) {
+      return error(res, 403, "Request origin is not allowed.");
+    }
+    const session = await getSession(req);
+    if (!session || session.role !== "admin") {
+      return error(res, 401, "Admin login is required.");
+    }
+    const id = Number(adminCarMatch[1]);
+    const carIndex = store.cars.findIndex((car) => Number(car.id) === id);
+    if (carIndex === -1) {
+      return error(res, 404, "Vehicle not found.");
+    }
+    const [removedCar] = store.cars.splice(carIndex, 1);
+    await logEvent("Car removed from fleet: " + (removedCar.name || id));
+    await saveStore();
+    return json(res, 200, { ok: true, id });
+  }
+
   if (req.method === "POST") {
     if (!sameOrigin(req))
       return error(res, 403, "Request origin is not allowed.");
