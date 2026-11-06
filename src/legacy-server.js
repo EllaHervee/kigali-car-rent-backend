@@ -26,6 +26,7 @@ const storePath = path.join(dataDir, "store.json");
 const port = Number(process.env.PORT || 3000);
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000;
 const emailVerificationLifetime = 24 * 60 * 60 * 1000;
+const passwordResetLifetime = 60 * 60 * 1000;
 const accountDeletionGracePeriod = 30 * 24 * 60 * 60 * 1000;
 const adminEmail =
   process.env.ADMIN_EMAIL?.trim().toLowerCase() ||
@@ -350,6 +351,41 @@ async function sendEmailVerification(identifier) {
   });
 }
 
+async function sendPasswordReset(identifier) {
+  const user = store.users[identifier];
+  if (!user || !user.email) return;
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  for (const [hash, reset] of Object.entries(store.passwordResets)) {
+    if (reset.identifier === identifier) delete store.passwordResets[hash];
+  }
+  store.passwordResets[tokenHash] = {
+    identifier,
+    expiresAt: Date.now() + passwordResetLifetime,
+  };
+  await saveStore();
+  const resetUrl = new URL(
+    process.env.FRONTEND_URL || "http://localhost:3000",
+  );
+  resetUrl.pathname = "/index.html";
+  resetUrl.search = "";
+  resetUrl.hash = "";
+  resetUrl.searchParams.set("reset_password", token);
+  const link = resetUrl.toString();
+  await sendResendEmail({
+    to: user.email,
+    subject: "Reset your Kigali Car Rent password",
+    text:
+      "Use this link to choose a new Kigali Car Rent password: " +
+      link +
+      "\n\nThis link expires in one hour. If you did not request a reset, you can ignore this email.",
+    html:
+      "<p>Hello,</p><p>Use this link to choose a new Kigali Car Rent password.</p><p><a href=\"" +
+      link +
+      "\">Reset my password</a></p><p>This link expires in one hour. If you did not request a reset, you can ignore this email.</p>",
+  });
+}
+
 async function sendAdminLoginAlert() {
   if (!adminEmail) {
     console.error("Could not send admin login alert: ADMIN_EMAIL is not set.");
@@ -400,15 +436,16 @@ async function purgeExpiredAccounts(targetStore = store) {
       deletedIdentifiers.push(identifier);
     }
   }
-  if (!deletedIdentifiers.length) return;
-
   const deletedSet = new Set(deletedIdentifiers);
-  targetStore.authEvents = targetStore.authEvents.filter(
-    (event) => !deletedSet.has(event.phone),
-  );
-  for (const [token, session] of Object.entries(targetStore.sessions)) {
-    if (session.role === "customer" && deletedSet.has(session.phone)) {
-      delete targetStore.sessions[token];
+  let changed = false;
+  if (deletedSet.size) {
+    targetStore.authEvents = targetStore.authEvents.filter(
+      (event) => !deletedSet.has(event.phone),
+    );
+    for (const [token, session] of Object.entries(targetStore.sessions)) {
+      if (session.role === "customer" && deletedSet.has(session.phone)) {
+        delete targetStore.sessions[token];
+      }
     }
   }
   for (const [tokenHash, verification] of Object.entries(
@@ -416,9 +453,17 @@ async function purgeExpiredAccounts(targetStore = store) {
   )) {
     if (deletedSet.has(verification.identifier)) {
       delete targetStore.emailVerifications[tokenHash];
+      changed = true;
     }
   }
-  if (targetStore === store) await saveStore();
+  for (const [tokenHash, reset] of Object.entries(targetStore.passwordResets)) {
+    if (reset.expiresAt <= now || deletedSet.has(reset.identifier)) {
+      delete targetStore.passwordResets[tokenHash];
+      changed = true;
+    }
+  }
+  if (deletedSet.size) changed = true;
+  if (changed && targetStore === store) await saveStore();
 }
 
 async function readJson(req, maxLength = 8192) {
@@ -961,10 +1006,20 @@ async function handleApi(req, res, url) {
       const identifier = suppliedIdentifier.includes("@")
         ? normalizeEmail(suppliedIdentifier)
         : normalizePhone(suppliedIdentifier);
-      const user = store.users[identifier];
+      let accountIdentifier = identifier;
+      let user = store.users[accountIdentifier];
+      if (!user && isEmail(identifier)) {
+        const matchingAccount = Object.entries(store.users).find(
+          ([, candidate]) => normalizeEmail(candidate.email || "") === identifier,
+        );
+        if (matchingAccount) {
+          accountIdentifier = matchingAccount[0];
+          user = matchingAccount[1];
+        }
+      }
       if (user && user.email && user.emailVerified !== true) {
         try {
-          await sendEmailVerification(identifier);
+          await sendEmailVerification(accountIdentifier);
         } catch (e) {
           console.error("Could not send account verification email:", e);
           return error(res, 503, "Could not send the verification email. Try again later.");
@@ -1022,6 +1077,100 @@ async function handleApi(req, res, url) {
           role: "customer",
         },
       });
+    }
+
+    if (url.pathname === "/api/auth/password/forgot") {
+      if (!(await allowAttempt(req, "password-forgot"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      const email = normalizeEmail(body.email || "");
+      if (!isEmail(email) || email === adminEmail) {
+        return json(res, 200, {
+          message:
+            "If an account uses that email, a password reset link has been sent.",
+        });
+      }
+      const account = Object.entries(store.users).find(
+        ([, user]) => normalizeEmail(user.email || "") === email,
+      );
+      if (account) {
+        try {
+          await sendPasswordReset(account[0]);
+        } catch (e) {
+          console.error("Could not send password reset email:", e);
+          return error(
+            res,
+            503,
+            "Could not send the password reset email. Check the backend email settings and try again.",
+          );
+        }
+      }
+      await resetAttempts(req, "password-forgot");
+      return json(res, 200, {
+        message:
+          "If an account uses that email, a password reset link has been sent.",
+      });
+    }
+
+    if (url.pathname === "/api/auth/password/reset") {
+      if (!(await allowAttempt(req, "password-reset"))) {
+        return error(res, 429, "Too many attempts. Try again later.");
+      }
+      const token =
+        typeof body.token === "string" ? body.token.toLowerCase() : "";
+      const password = String(body.password || "");
+      if (!/^[a-f0-9]{64}$/.test(token)) {
+        return error(res, 400, "This password reset link is invalid or expired.");
+      }
+      if (password.length < 8 || password.length > 128) {
+        return error(res, 400, "Password must be between 8 and 128 characters.");
+      }
+      if (
+        !/[a-z]/.test(password) ||
+        !/[A-Z]/.test(password) ||
+        !/[0-9]/.test(password)
+      ) {
+        return error(
+          res,
+          400,
+          "Include at least one uppercase letter, one lowercase letter, and one number.",
+        );
+      }
+      const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+      const reset = store.passwordResets[tokenHash];
+      if (!reset || reset.expiresAt <= Date.now()) {
+        if (reset) {
+          delete store.passwordResets[tokenHash];
+          await saveStore();
+        }
+        return error(res, 400, "This password reset link is invalid or expired.");
+      }
+      const user = store.users[reset.identifier];
+      if (!user || !user.email) {
+        delete store.passwordResets[tokenHash];
+        await saveStore();
+        return error(res, 400, "This password reset link is invalid or expired.");
+      }
+      const salt = crypto.randomBytes(16).toString("hex");
+      user.salt = salt;
+      user.hash = (await passwordHash(password, salt)).toString("hex");
+      user.emailVerified = true;
+      for (const [hash, entry] of Object.entries(store.passwordResets)) {
+        if (entry.identifier === reset.identifier) {
+          delete store.passwordResets[hash];
+        }
+      }
+      for (const [hash, entry] of Object.entries(store.emailVerifications)) {
+        if (entry.identifier === reset.identifier) {
+          delete store.emailVerifications[hash];
+        }
+      }
+      for (const [sessionToken, session] of Object.entries(store.sessions)) {
+        if (session.phone === reset.identifier) delete store.sessions[sessionToken];
+      }
+      await logEvent("Password reset completed", reset.identifier);
+      await resetAttempts(req, "password-reset");
+      return json(res, 200, { ok: true });
     }
 
     if (url.pathname === "/api/register") {
@@ -1628,6 +1777,7 @@ function emptyStore() {
     sessions: {},
     loginAttempts: {},
     emailVerifications: {},
+    passwordResets: {},
     catalogSeedVersion,
   };
 }
@@ -1665,6 +1815,9 @@ function normalizeStore(value, source) {
     typeof value.emailVerifications !== "object"
   ) {
     value.emailVerifications = {};
+  }
+  if (!value.passwordResets || typeof value.passwordResets !== "object") {
+    value.passwordResets = {};
   }
   return value;
 }
