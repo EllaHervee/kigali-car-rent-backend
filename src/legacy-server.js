@@ -133,6 +133,7 @@ function publicUser(identifier, user) {
     phone: user.phone || (isPhone(identifier) ? identifier : null),
     email: user.email || (isEmail(identifier) ? identifier : null),
     joinedAt: user.createdAt,
+    role: user.role === "admin" ? "admin" : "customer",
     deletionScheduledAt: user.deletionScheduledAt || null,
   };
 }
@@ -923,9 +924,10 @@ async function handleApi(req, res, url) {
         identity.email,
       );
       await resetAttempts(req, "google-auth");
-      await createSession(res, "customer", identity.email);
+      const role = user.role === "admin" ? "admin" : "customer";
+      await createSession(res, role, identity.email);
       return json(res, isNewUser ? 201 : 200, {
-        user: { ...publicUser(identity.email, user), role: "customer" },
+        user: { ...publicUser(identity.email, user), role },
       });
     }
 
@@ -1164,10 +1166,14 @@ async function handleApi(req, res, url) {
         });
       }
       await resetAttempts(req, "login");
-      await logEvent("Customer logged in", identifier);
-      await createSession(res, "customer", identifier);
+      const role = user.role === "admin" ? "admin" : "customer";
+      await logEvent(
+        role === "admin" ? "Admin logged in" : "Customer logged in",
+        identifier,
+      );
+      await createSession(res, role, identifier);
       return json(res, 200, {
-        user: { ...publicUser(identifier, user), role: "customer" },
+        user: { ...publicUser(identifier, user), role },
       });
     }
 
@@ -1498,6 +1504,53 @@ async function handleApi(req, res, url) {
       cars: store.cars,
       messages: store.messages,
     });
+  }
+
+  if (req.method === "PATCH" && url.pathname === "/api/admin/users/role") {
+    const session = await getSession(req);
+    if (!session || session.role !== "admin") {
+      return error(res, 401, "Admin login is required.");
+    }
+    if (!sameOrigin(req)) {
+      return error(res, 403, "Request origin is not allowed.");
+    }
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (e) {
+      return error(res, e.status || 400, e.message);
+    }
+    const identifier = String(body.id || "").trim();
+    const role =
+      body.role === "admin"
+        ? "admin"
+        : body.role === "customer"
+          ? "customer"
+          : "";
+    const user = store.users[identifier];
+    if (!user || !role) return error(res, 404, "Registered account not found.");
+    if (identifier === session.phone) {
+      return error(res, 400, "You cannot change your own administrator access.");
+    }
+    user.role = role;
+    if (role === "customer") {
+      for (const [token, activeSession] of Object.entries(store.sessions)) {
+        if (
+          activeSession.phone === identifier &&
+          activeSession.role === "admin"
+        ) {
+          delete store.sessions[token];
+        }
+      }
+    }
+    await logEvent(
+      (role === "admin"
+        ? "Administrator access granted to "
+        : "Administrator access removed from ") + identifier,
+      session.phone,
+    );
+    await saveStore();
+    return json(res, 200, { user: publicUser(identifier, user) });
   }
 
   return error(res, 404, "API route not found.");
